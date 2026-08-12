@@ -10,12 +10,14 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Language helper
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
 
+// Translation logic
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
@@ -30,6 +32,7 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return null; }
 }
 
+// OCR logic
 async function extractTextWithOCR(imageBuffer) {
     try {
         const formData = new FormData();
@@ -37,7 +40,6 @@ async function extractTextWithOCR(imageBuffer) {
         formData.append('file', imageBuffer, { filename: 'image.jpg' });
         formData.append('language', 'eng');
         formData.append('OCREngine', '2');
-        formData.append('scale', 'true');
         formData.append('isOverlayRequired', 'true');
 
         const response = await axios.post('https://api.ocr.space/parse/image', formData, {
@@ -46,93 +48,82 @@ async function extractTextWithOCR(imageBuffer) {
         });
 
         if (response.data && response.data.OCRExitCode === 1) {
-            const result = response.data.ParsedResults[0];
             return {
-                text: result.ParsedText.trim(),
-                lines: result.TextOverlay ? result.TextOverlay.Lines : []
+                text: response.data.ParsedResults[0].ParsedText.trim(),
+                lines: response.data.ParsedResults[0].TextOverlay.Lines
             };
         }
         return null;
     } catch (e) { return null; }
 }
 
+// Font cache
 let fontCache = {};
 async function getFont(size, color) {
     const key = `${size}-${color}`;
     if (fontCache[key]) return fontCache[key];
-    const urls = {
-        '16-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-black/open-sans-16-black.fnt',
-        '16-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-white/open-sans-16-white.fnt',
-        '32-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-32-black/open-sans-32-black.fnt',
-        '32-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-32-white/open-sans-32-white.fnt',
-        '64-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-black/open-sans-64-black.fnt',
-        '64-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-white/open-sans-64-white.fnt',
-    };
-    const url = urls[key];
-    try {
-        const font = await Jimp.loadFont(url);
-        fontCache[key] = font;
-        return font;
-    } catch (err) { throw err; }
+    const url = `https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-${size}-${color}/open-sans-${size}-${color}.fnt`;
+    const font = await Jimp.loadFont(url);
+    fontCache[key] = font;
+    return font;
 }
 
 async function renderTextOnImage(imageBuffer, regions) {
     let image = await Jimp.read(imageBuffer);
+    const imgW = image.bitmap.width;
 
     for (const region of regions) {
         const [x, y, w, h] = region.boundingBox.split(',').map(Number);
-        if (w <= 0 || h <= 0) continue;
-
-        const actualW = Math.min(x + w, image.bitmap.width) - x;
-        const actualH = Math.min(y + h, image.bitmap.height) - y;
-
-        // Sample background
-        const idx = (Math.floor(y + actualH / 2) * image.bitmap.width + Math.floor(x + actualW / 2)) * 4;
-        const avgR = image.bitmap.data[idx], avgG = image.bitmap.data[idx+1], avgB = image.bitmap.data[idx+2];
-
         const text = region.tranContent || '';
-        if (!text) continue;
+        if (!text || w <= 0 || h <= 0) continue;
 
-        // --- NEW FITTING LOGIC ---
-        // 1. Determine starting size based on height
-        let size = 16;
-        if (actualH > 60) size = 64;
-        else if (actualH > 30) size = 32;
+        // 1. DYNAMIC FONT REDUCTION
+        // Calculate how much space is left before the right edge of the image
+        const availableWidth = imgW - x - 10; 
+        
+        let size = 32; // Default starting size
+        if (h < 25) size = 16;
+        if (h > 60) size = 64;
 
-        // 2. Shrink font size if the text is too wide for the box
-        let charWidth = size * 0.55;
-        while (size > 16 && (text.length * charWidth > actualW)) {
-            if (size === 64) size = 32;
-            else if (size === 32) size = 16;
-            charWidth = size * 0.55;
+        // Reduce size if it exceeds the image border
+        let estimatedWidth = text.length * (size * 0.55);
+        while (size > 16 && estimatedWidth > availableWidth) {
+            size = (size === 64) ? 32 : 16;
+            estimatedWidth = text.length * (size * 0.55);
         }
 
-        // 3. Expand the background box slightly if French is longer (fixes the "gray box" clipping)
-        const textWidth = text.length * charWidth;
-        const fillWidth = Math.max(actualW, Math.min(textWidth + 10, image.bitmap.width - x));
+        // 2. TRANSPARENT-LOOKING BACKGROUND
+        // Sample color from just outside the top-left of the original text
+        const sampleX = Math.max(0, x - 2);
+        const sampleY = Math.max(0, y - 2);
+        const bgColor = image.getPixelColor(sampleX, sampleY);
+        
+        // Convert to RGB for brightness check
+        const rgba = Jimp.intToRGBA(bgColor);
+        const brightness = (rgba.r * 0.299 + rgba.g * 0.587 + rgba.b * 0.114);
+        const textColor = brightness > 125 ? 'black' : 'white';
 
-        image.scan(x, y, fillWidth, actualH, function(px, py, idx) {
-            this.bitmap.data[idx + 0] = avgR;
-            this.bitmap.data[idx + 1] = avgG;
-            this.bitmap.data[idx + 2] = avgB;
-            this.bitmap.data[idx + 3] = 255;
+        // 3. SURGICAL FILL (Only fill the width of the actual text)
+        const textWidth = Math.min(estimatedWidth + 10, availableWidth);
+        image.scan(x, y, textWidth, h, function(px, py, idx) {
+            this.bitmap.data[idx + 0] = rgba.r;
+            this.bitmap.data[idx + 1] = rgba.g;
+            this.bitmap.data[idx + 2] = rgba.b;
+            this.bitmap.data[idx + 3] = 255; // Solid to cover old text
         });
 
-        // 4. No more aggressive "maxChars" truncation. 
-        // We only use ellipsis if it's physically impossible to fit on one line at the smallest font.
-        let finalDisplayToken = text;
-        const absoluteMaxChars = Math.floor((image.bitmap.width - x) / charWidth);
-        if (text.length > absoluteMaxChars) {
-            finalDisplayToken = text.substring(0, absoluteMaxChars - 3) + "...";
+        // 4. FINAL RENDER
+        const font = await getFont(size, textColor);
+        const verticalCenter = y + (h - (size * 1.1)) / 2;
+        
+        // Final sanity check for truncation (only if even 16px hits the screen edge)
+        let finalStr = text;
+        if (text.length * (size * 0.52) > availableWidth) {
+            const maxChars = Math.floor(availableWidth / (size * 0.52));
+            finalStr = text.substring(0, maxChars - 3) + "...";
         }
 
-        const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
-        const color = brightness > 128 ? 'black' : 'white';
-        const font = await getFont(size, color);
-
-        // Center vertically in the original box
-        const startY = y + (actualH - (size * 1.2)) / 2;
-        image.print(font, x + 5, startY, finalDisplayToken);
+        image.print(font, x + 2, verticalCenter, finalStr);
     }
 
     const renderedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
@@ -141,8 +132,7 @@ async function renderTextOnImage(imageBuffer, regions) {
 
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
-    const from = req.body.from || "auto";
-    const to = req.body.to || "zh";
+    const { from = "auto", to = "zh" } = req.body;
 
     try {
         const ocr = await extractTextWithOCR(req.file.buffer);
@@ -152,11 +142,13 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
         const resRegions = [];
         for (const line of ocr.lines) {
-            const dstText = (await translateWithGoogle(line.LineText, from, to)) || line.LineText;
-            const first = line.Words[0], last = line.Words[line.Words.length - 1];
+            const dstText = await translateWithGoogle(line.LineText, from, to) || line.LineText;
+            const first = line.Words[0];
+            const last = line.Words[line.Words.length - 1];
+            
             resRegions.push({
                 tranContent: dstText,
-                boundingBox: `${Math.round(first.Left)},${Math.round(first.Top)},${Math.round((last.Left + last.Width) - first.Left)},${Math.round(line.MaxHeight || 30)}`
+                boundingBox: `${first.Left},${first.Top},${(last.Left + last.Width) - first.Left},${line.MaxHeight}`
             });
         }
 
@@ -165,5 +157,5 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     } catch (err) { res.json({ errorCode: 1, msg: err.message }); }
 });
 
-app.listen(3000, () => console.log("Relay Live"));
+app.listen(3000, () => console.log("Relay running"));
 export default app;
