@@ -12,7 +12,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // --- UTILS ---
 function toGoogleLang(l) {
-    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "ko": "ko", "fra": "fr", "spa": "es", "th": "th", "it": "it", "id": "id" };
+    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "ko": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
@@ -31,7 +31,7 @@ async function translateWithGoogle(txt, f, t) {
         let tgt = toGoogleLang(t);
         const params = new URLSearchParams({ client: 'gtx', sl: src, tl: tgt, dt: 't', q: txt });
         const r = await axios.get(`https://translate.googleapis.com/translate_a/single?${params.toString()}`, {
-            timeout: 5000,
+            timeout: 4000,
             headers: { "User-Agent": "Mozilla/5.0" }
         });
         if (r.data && r.data[0]) return r.data[0].map(s => s[0]).join("").trim();
@@ -39,36 +39,30 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return null; }
 }
 
-// --- MAIN ENDPOINT ---
+// --- PIXPIN NATIVE ENDPOINT ---
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     // 🔍 LOGGING: INCOMING DATA
-    console.log("\n" + "=".repeat(80));
-    console.log("📥 NEW PIXPIN REQUEST RECEIVED");
-    console.log("--------------------------------------------------");
-    console.log("1. HEADERS:", JSON.stringify(req.headers, null, 2));
-    console.log("2. QUERY PARAMS:", JSON.stringify(req.query, null, 2));
+    console.log("\n📥 NEW PIXPIN REQUEST RECEIVED");
+    console.log("Headers:", JSON.stringify(req.headers));
     
-    if (req.file) console.log("3. BODY FIELDS: { image: [Buffer] }");
-
     const fromRequested = req.query.from || req.body.from || "auto";
     const toRequested = req.query.to || req.body.to || "zh";
 
-    if (!req.file) return res.json({ errorCode: 1, msg: "No image file" });
+    if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
 
     try {
         const tLang = getTessLang(fromRequested);
         const image = await Jimp.read(req.file.buffer);
 
-        console.log(`   🔍 Starting OCR (Lang: ${tLang})...`);
+        // OCR - Vercel only allows writing to /tmp
         const ocrResult = await Tesseract.recognize(
             req.file.buffer,
             tLang,
             { 
                 cachePath: '/tmp',
-                logger: m => console.log(`OCR Status: ${m.status}`) 
+                logger: m => console.log(`OCR: ${m.status}`) 
             }
         );
-        console.log("\n   ✅ OCR Complete");
 
         const resRegions = [];
         let fragments = ocrResult.data.lines || ocrResult.data.words || [];
@@ -78,8 +72,8 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             const srcText = item.text.trim();
             if (srcText.length < 1) continue;
 
-            console.log(`   🔄 Processing Block ${i+1}...`);
             const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
+            console.log(`Translated: ${srcText.substring(0,10)} -> ${dstText.substring(0,10)}`);
 
             const b = item.bbox;
             const x = Math.round(b.x0);
@@ -87,7 +81,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             const w = Math.round(b.x1 - b.x0);
             const h = Math.round(b.y1 - b.y0);
 
-            // Paint white box
+            // Paint background for PixPin
             image.scan(x, y, w, h, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = 255;
                 this.bitmap.data[idx + 1] = 255;
@@ -103,21 +97,16 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         }
 
         const imageBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
-        const finalResponse = {
+
+        console.log("📤 SENDING SUCCESS TO PIXPIN");
+        res.json({
             errorCode: 0,
             render_image: imageBuffer.toString("base64"),
             resRegions: resRegions
-        };
-
-        console.log("-".repeat(80));
-        console.log("📤 SENDING NATIVE JSON TO PIXPIN");
-        console.dir(finalResponse, { depth: 1, colors: true }); 
-        console.log("=".repeat(80));
-
-        res.json(finalResponse);
+        });
 
     } catch (err) {
-        console.error("   ❌ ERROR:", err.message);
+        console.error("❌ ERROR:", err.message);
         res.json({ errorCode: 1, msg: err.message });
     }
 });
