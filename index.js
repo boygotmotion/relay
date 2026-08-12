@@ -30,7 +30,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
         const uploadResponse = await axios.post('https://api.imgbb.com/1/upload', formData, {
             headers: formData.getHeaders(),
-            params: { key: 'YOUR_IMGBB_API_KEY' } // Get free key from imgbb.com
+            params: { key: '3d82321f5628ca768792c1c1d0297ca3' } // Get free key from imgbb.com
         });
 
         const imageUrl = uploadResponse.data.data.url;
