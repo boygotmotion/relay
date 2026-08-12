@@ -2,9 +2,7 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
-import { createCanvas, loadImage, registerFont } from "canvas";
-import fs from "fs";
-import path from "path";
+import sharp from "sharp";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -17,7 +15,7 @@ app.post("/", (req, res) => {
 });
 
 // =============================================
-// 1. FONT MANAGEMENT (download from GitHub on startup)
+// 1. FONT MANAGEMENT (download from GitHub)
 // =============================================
 const FONT_SOURCES = {
     'zh': { family: 'NotoSansSC', url: 'https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/Subset/OTF/SimplifiedChinese/NotoSansSC-Regular.otf' },
@@ -27,34 +25,24 @@ const FONT_SOURCES = {
     'th': { family: 'NotoSansThai', url: 'https://raw.githubusercontent.com/google/fonts/main/ofl/notosansthai/NotoSansThai%5Bwght%5D.ttf' },
 };
 
-const fontCache = new Map();
+const fontCache = {};
 
-async function downloadAndRegisterFont(lang) {
+async function getFontBase64(lang) {
+    if (fontCache[lang]) return fontCache[lang];
     const source = FONT_SOURCES[lang];
     if (!source) return null;
-    if (fontCache.has(source.family)) return source.family;
 
     try {
         const response = await axios.get(source.url, { responseType: 'arraybuffer' });
-        const fontData = Buffer.from(response.data);
-        const tmpPath = path.join('/tmp', `${source.family}.otf`);
-        fs.writeFileSync(tmpPath, fontData);
-        registerFont(tmpPath, { family: source.family });
-        fontCache.set(source.family, tmpPath);
-        console.log(`✅ Font registered: ${source.family}`);
-        return source.family;
+        const base64 = Buffer.from(response.data).toString('base64');
+        fontCache[lang] = base64;
+        console.log(`✅ Font downloaded: ${source.family}`);
+        return base64;
     } catch (err) {
-        console.error(`❌ Failed to download/register ${source.family}: ${err.message}`);
+        console.error(`❌ Failed to download font for ${lang}: ${err.message}`);
         return null;
     }
 }
-
-// Pre‑download all fonts at startup (cold start will take a bit longer)
-(async () => {
-    const langs = Object.keys(FONT_SOURCES);
-    await Promise.all(langs.map(downloadAndRegisterFont));
-    console.log('🎯 All fonts ready');
-})();
 
 function getFontFamily(lang) {
     const map = {
@@ -83,7 +71,7 @@ function toGoogleLang(l) {
 }
 
 // =============================================
-// 3. GOOGLE TRANSLATE (free, no API key)
+// 3. GOOGLE TRANSLATE
 // =============================================
 async function translateWithGoogle(txt, f, t) {
     try {
@@ -100,7 +88,7 @@ async function translateWithGoogle(txt, f, t) {
 }
 
 // =============================================
-// 4. OCR.SPACE (free, no registration)
+// 4. OCR.SPACE
 // =============================================
 async function extractTextWithOCR(imageBuffer) {
     try {
@@ -132,98 +120,63 @@ async function extractTextWithOCR(imageBuffer) {
 }
 
 // =============================================
-// 5. IMAGE RENDERING (canvas with proper font)
+// 5. IMAGE RENDERING (sharp + SVG)
 // =============================================
 async function renderTextOnImage(imageBuffer, regions, targetLang) {
-    const errors = [];
     try {
-        const img = await loadImage(imageBuffer);
-        const width = img.width;
-        const height = img.height;
+        // Get original image metadata
+        const metadata = await sharp(imageBuffer).metadata();
+        const width = metadata.width;
+        const height = metadata.height;
 
-        const canvas = createCanvas(width, height);
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0);
+        // Build SVG
+        let svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
+        svg += `<style>`;
 
-        // Get image data for sampling background
-        const imageData = ctx.getImageData(0, 0, width, height);
-        const data = imageData.data;
-        const getPixel = (px, py) => {
-            if (px < 0 || py < 0 || px >= width || py >= height) return null;
-            const idx = (py * width + px) * 4;
-            return [data[idx], data[idx+1], data[idx+2]];
-        };
-
+        // Embed font if needed (non-Latin scripts)
         const fontFamily = getFontFamily(targetLang);
+        const needsFont = ['zh','ja','ko','ar','th'].includes(targetLang);
+        if (needsFont) {
+            const fontBase64 = await getFontBase64(targetLang);
+            if (fontBase64) {
+                const fontFormat = targetLang === 'ar' || targetLang === 'th' ? 'ttf' : 'otf';
+                svg += `@font-face { font-family: '${fontFamily}'; src: url(data:font/${fontFormat};base64,${fontBase64}); }`;
+            } else {
+                // fallback to system font
+                console.warn(`⚠️ Font not available for ${targetLang}, using system fallback`);
+            }
+        }
+        svg += `</style>`;
 
+        // Embed original image as base64
+        const imgBase64 = imageBuffer.toString('base64');
+        svg += `<image href="data:image/jpeg;base64,${imgBase64}" width="${width}" height="${height}" />`;
+
+        // Add text overlays
         for (const region of regions) {
             const [x, y, w, h] = region.boundingBox.split(',').map(Number);
-            if (w <= 0 || h <= 0 || x < 0 || y < 0 || x >= width || y >= height) {
-                errors.push(`Invalid region: ${region.boundingBox}`);
-                console.warn(`⚠️ ${errors[errors.length-1]}`);
-                continue;
-            }
-
-            // Sample background color from 1‑px border
-            const sampleColors = [];
-            // top & bottom edges
-            for (let px = Math.max(0, x-1); px < Math.min(x+w+1, width); px++) {
-                for (const py of [Math.max(0, y-1), Math.min(y+h, height-1)]) {
-                    const c = getPixel(px, py);
-                    if (c) sampleColors.push(c);
-                }
-            }
-            // left & right edges
-            for (let py = Math.max(0, y-1); py < Math.min(y+h+1, height); py++) {
-                for (const px of [Math.max(0, x-1), Math.min(x+w, width-1)]) {
-                    const c = getPixel(px, py);
-                    if (c) sampleColors.push(c);
-                }
-            }
-
-            let avgR = 0, avgG = 0, avgB = 0;
-            for (const c of sampleColors) {
-                avgR += c[0]; avgG += c[1]; avgB += c[2];
-            }
-            if (sampleColors.length > 0) {
-                avgR = Math.round(avgR / sampleColors.length);
-                avgG = Math.round(avgG / sampleColors.length);
-                avgB = Math.round(avgB / sampleColors.length);
-            } else {
-                avgR = 255; avgG = 255; avgB = 255;
-            }
-
-            // Fill region with background color (opaque)
-            ctx.fillStyle = `rgb(${avgR},${avgG},${avgB})`;
-            ctx.fillRect(x, y, w, h);
-
-            // Translated text
+            if (w <= 0 || h <= 0 || x < 0 || y < 0) continue;
             const text = region.tranContent || '';
             if (!text) continue;
 
             // Determine font size
             let fontSize = Math.min(h * 0.8, 64);
-            const maxWidth = w - 10;
-            const maxHeight = h - 10;
-
-            // Measure text and shrink if needed
-            const measureCtx = canvas.getContext('2d');
-            measureCtx.font = `bold ${fontSize}px '${fontFamily}'`;
-            let textWidth = measureCtx.measureText(text).width;
-            while (textWidth > maxWidth && fontSize > 10) {
+            // Estimate text width (simplistic: assume each char width ≈ fontSize * 0.6)
+            const avgCharWidth = fontSize * 0.6;
+            let textWidth = text.length * avgCharWidth;
+            while (textWidth > w - 10 && fontSize > 8) {
                 fontSize -= 2;
-                measureCtx.font = `bold ${fontSize}px '${fontFamily}'`;
-                textWidth = measureCtx.measureText(text).width;
+                textWidth = text.length * fontSize * 0.6;
             }
 
-            // Simple word wrap if multiple lines needed
+            // Word wrap (simple: split by spaces, but for CJK we may need character-based)
             const words = text.split(' ');
             let lines = [];
             let currentLine = '';
             for (const word of words) {
                 const testLine = currentLine ? currentLine + ' ' + word : word;
-                const testWidth = measureCtx.measureText(testLine).width;
-                if (testWidth < maxWidth) {
+                const testWidth = testLine.length * fontSize * 0.6;
+                if (testWidth < w - 10) {
                     currentLine = testLine;
                 } else {
                     if (currentLine) lines.push(currentLine);
@@ -232,50 +185,44 @@ async function renderTextOnImage(imageBuffer, regions, targetLang) {
             }
             if (currentLine) lines.push(currentLine);
 
-            const lineHeight = fontSize * 1.4;
+            const lineHeight = fontSize * 1.2;
             const totalTextHeight = lines.length * lineHeight;
-            if (totalTextHeight > maxHeight) {
-                // Shrink font further to fit height
-                fontSize = Math.floor(fontSize * (maxHeight / totalTextHeight));
-                if (fontSize < 8) fontSize = 8;
-                // Re‑wrap with new size
-                measureCtx.font = `bold ${fontSize}px '${fontFamily}'`;
-                lines = [];
-                currentLine = '';
-                for (const word of words) {
-                    const testLine = currentLine ? currentLine + ' ' + word : word;
-                    const testWidth = measureCtx.measureText(testLine).width;
-                    if (testWidth < maxWidth) {
-                        currentLine = testLine;
-                    } else {
-                        if (currentLine) lines.push(currentLine);
-                        currentLine = word;
-                    }
-                }
-                if (currentLine) lines.push(currentLine);
-            }
+            let startY = y + (h - totalTextHeight) / 2 + fontSize * 0.8;
+            if (startY < y) startY = y + fontSize;
 
-            // Choose text color (black on light bg, white on dark)
-            const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
-            ctx.fillStyle = brightness > 128 ? '#000000' : '#FFFFFF';
-            ctx.font = `bold ${fontSize}px '${fontFamily}'`;
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
+            // For RTL languages (Arabic), we might want to set direction, but we'll keep it simple.
+            const textColor = '#000000'; // we'll determine based on background later? We'll sample background but in SVG we can't easily sample. We'll use black with a white outline for readability.
+            // Simpler: use black text with a white stroke for readability.
+            const color = '#000000';
+            const stroke = '#FFFFFF';
 
-            const startY = y + (h - lines.length * lineHeight) / 2 + lineHeight / 2;
             for (let i = 0; i < lines.length; i++) {
-                ctx.fillText(lines[i], x + w / 2, startY + i * lineHeight);
+                const line = lines[i];
+                const lineWidth = line.length * fontSize * 0.6;
+                const startX = x + (w - lineWidth) / 2;
+                const lineY = startY + i * lineHeight;
+                // Draw text with stroke and fill
+                svg += `<text x="${startX}" y="${lineY}" font-family="${fontFamily}" font-size="${fontSize}" fill="${color}" stroke="${stroke}" stroke-width="1.5" font-weight="bold">${escapeXML(line)}</text>`;
             }
         }
 
-        const buffer = canvas.toBuffer('image/jpeg', { quality: 0.9 });
-        console.log(`✅ Rendered image size: ${buffer.length} bytes`);
-        return { renderedBuffer: buffer, errors };
+        svg += '</svg>';
+
+        // Render SVG to PNG using sharp
+        const renderedBuffer = await sharp(Buffer.from(svg))
+            .png()
+            .toBuffer();
+
+        console.log(`✅ Rendered image size: ${renderedBuffer.length} bytes`);
+        return { renderedBuffer, errors: [] };
     } catch (err) {
-        errors.push(`Render error: ${err.message}`);
-        console.error(errors[0]);
-        return { renderedBuffer: null, errors };
+        console.error('❌ Render error:', err.message);
+        return { renderedBuffer: null, errors: [err.message] };
     }
+}
+
+function escapeXML(text) {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // =============================================
@@ -303,12 +250,11 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         }
         console.log(`📝 Extracted: ${ocrResult.text.substring(0, 100)}...`);
 
-        // Build resRegions with translated text
+        // Build resRegions
         const resRegions = [];
         for (const line of ocrResult.lines) {
             const srcText = line.LineText.trim();
             if (!srcText) continue;
-
             const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
             if (line.Words && line.Words.length > 0) {
                 const firstWord = line.Words[0];
@@ -324,7 +270,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
                 });
             }
         }
-
         if (resRegions.length === 0 && ocrResult.text) {
             const dstText = (await translateWithGoogle(ocrResult.text, fromRequested, toRequested)) || ocrResult.text;
             resRegions.push({
@@ -335,9 +280,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         }
 
         console.log(`📤 Found ${resRegions.length} regions to render`);
-
-        // Ensure the target language's font is downloaded (lazy load if not already)
-        await downloadAndRegisterFont(toRequested);
 
         const { renderedBuffer, errors } = await renderTextOnImage(req.file.buffer, resRegions, toRequested);
 
