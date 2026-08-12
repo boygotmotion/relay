@@ -1,8 +1,8 @@
 const express = require("express");
 const axios = require("axios");
 const multer = require("multer");
-const Tesseract = require("tesseract.js");
 const Jimp = require("jimp");
+const ocrad = require("ocrad.js");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -19,14 +19,6 @@ function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
-}
-
-function getTessLang(f) {
-    const l = String(f).toLowerCase();
-    if (l.startsWith("zh")) return "chi_sim";
-    if (l.startsWith("jp") || l.startsWith("ja")) return "jpn";
-    if (l.startsWith("ko")) return "kor";
-    return "eng";
 }
 
 async function translateWithGoogle(txt, f, t) {
@@ -51,47 +43,31 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
 
     try {
-        const tLang = getTessLang(fromRequested);
         const image = await Jimp.read(req.file.buffer);
-
-        // ✅ Force Tesseract to use CDN for WASM core
-        const result = await Tesseract.recognize(
-            req.file.buffer,
-            tLang,
-            {
-                cachePath: '/tmp',
-                corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.0/tesseract-core-simd.wasm',
-                logger: m => console.log(`OCR: ${m.status}`)
-            }
-        );
+        
+        // Convert image to grayscale for better OCR
+        const grayImage = image.clone().grayscale();
+        
+        // Get image buffer as PNG (ocrad.js works with PNG)
+        const pngBuffer = await grayImage.getBufferAsync(Jimp.MIME_PNG);
+        
+        // ✅ OCRAD.js — pure JavaScript OCR
+        const result = ocrad(pngBuffer);
+        
+        console.log(`📝 OCR Result: ${result}`);
 
         const resRegions = [];
-        let fragments = result.data.lines || result.data.words || [];
-
-        for (let i = 0; i < fragments.length; i++) {
-            const item = fragments[i];
-            const srcText = item.text.trim();
-            if (srcText.length < 1) continue;
-
+        
+        // ocrad.js returns plain text, no coordinates
+        // So we use the entire image as one region
+        const srcText = result.trim();
+        if (srcText.length > 0) {
             const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
-
-            const b = item.bbox;
-            const x = Math.round(b.x0);
-            const y = Math.round(b.y0);
-            const w = Math.round(b.x1 - b.x0);
-            const h = Math.round(b.y1 - b.y0);
-
-            image.scan(x, y, w, h, function(px, py, idx) {
-                this.bitmap.data[idx + 0] = 255;
-                this.bitmap.data[idx + 1] = 255;
-                this.bitmap.data[idx + 2] = 255;
-                this.bitmap.data[idx + 3] = 255;
-            });
 
             resRegions.push({
                 context: srcText,
                 tranContent: dstText,
-                boundingBox: `${x},${y},${w},${h}`
+                boundingBox: `0,0,${image.bitmap.width},${image.bitmap.height}`
             });
         }
 
@@ -104,6 +80,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         });
 
     } catch (err) {
+        console.error("❌ Error:", err.message);
         res.json({ errorCode: 1, msg: err.message });
     }
 });
