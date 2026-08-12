@@ -42,7 +42,7 @@ async function extractTextWithOCR(imageBuffer) {
         formData.append('language', 'eng');
         formData.append('OCREngine', '2');
         formData.append('scale', 'true');
-        formData.append('isOverlayRequired', 'true'); // Get word-level coordinates
+        formData.append('isOverlayRequired', 'true');
 
         const response = await axios.post('https://api.ocr.space/parse/image', formData, {
             headers: formData.getHeaders(),
@@ -64,22 +64,61 @@ async function extractTextWithOCR(imageBuffer) {
 }
 
 async function renderTextOnImage(imageBuffer, regions) {
+    const errors = [];
+    let image;
     try {
-        const image = await Jimp.read(imageBuffer);
-        for (const region of regions) {
-            const [x, y, w, h] = region.boundingBox.split(',').map(Number);
-            // White background for text
-            image.scan(x, y, w, h, function(px, py, idx) {
+        console.log('🖌️ Starting renderTextOnImage...');
+        image = await Jimp.read(imageBuffer);
+        console.log(`📐 Image dimensions: ${image.bitmap.width}x${image.bitmap.height}`);
+    } catch (err) {
+        errors.push(`Jimp.read failed: ${err.message}`);
+        console.error(errors[0]);
+        return { renderedBuffer: null, errors };
+    }
+
+    // Load built-in font
+    let font;
+    try {
+        font = Jimp.FONT_SANS_16_BLACK;
+        if (!font) {
+            throw new Error('Jimp.FONT_SANS_16_BLACK is undefined');
+        }
+        console.log('✅ Font loaded');
+    } catch (err) {
+        errors.push(`Font load failed: ${err.message}`);
+        console.error(errors[0]);
+        return { renderedBuffer: null, errors };
+    }
+
+    for (let i = 0; i < regions.length; i++) {
+        const region = regions[i];
+        const [x, y, w, h] = region.boundingBox.split(',').map(Number);
+        console.log(`📦 Region ${i}: x=${x}, y=${y}, w=${w}, h=${h}`);
+
+        // Validate region
+        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x >= image.bitmap.width || y >= image.bitmap.height) {
+            const errMsg = `Invalid region ${i}: ${region.boundingBox}`;
+            errors.push(errMsg);
+            console.warn(`⚠️ ${errMsg}`);
+            continue;
+        }
+
+        const endX = Math.min(x + w, image.bitmap.width);
+        const endY = Math.min(y + h, image.bitmap.height);
+        const actualW = endX - x;
+        const actualH = endY - y;
+
+        try {
+            // Paint white background
+            image.scan(x, y, actualW, actualH, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = 255;
                 this.bitmap.data[idx + 1] = 255;
                 this.bitmap.data[idx + 2] = 255;
                 this.bitmap.data[idx + 3] = 220;
             });
-            // Draw translated text with built-in bitmap font
-            const font = Jimp.FONT_SANS_16_BLACK;
-            const text = region.tranContent;
-            // Wrap text to fit width
-            const maxWidth = w - 10;
+
+            const text = region.tranContent || '';
+            const maxWidth = actualW - 10;
             const lines = [];
             let currentLine = '';
             const words = text.split(' ');
@@ -92,17 +131,32 @@ async function renderTextOnImage(imageBuffer, regions) {
                 }
             }
             if (currentLine) lines.push(currentLine);
+
             let lineY = y + 5;
+            const lineHeight = 20;
             for (const line of lines) {
+                if (lineY + lineHeight > endY) break;
                 image.print(font, x + 5, lineY, line);
-                lineY += 20;
+                lineY += lineHeight;
             }
+        } catch (err) {
+            const errMsg = `Render error on region ${i}: ${err.message}`;
+            errors.push(errMsg);
+            console.error(errMsg);
         }
-        return await image.getBufferAsync(Jimp.MIME_JPEG);
-    } catch (err) {
-        console.error('Render error:', err.message);
-        return null;
     }
+
+    let renderedBuffer = null;
+    try {
+        renderedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
+        console.log(`✅ Rendered image size: ${renderedBuffer.length} bytes`);
+    } catch (err) {
+        const errMsg = `getBufferAsync failed: ${err.message}`;
+        errors.push(errMsg);
+        console.error(errMsg);
+    }
+
+    return { renderedBuffer, errors };
 }
 
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
@@ -122,13 +176,14 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
                 errorCode: 1,
                 msg: "No text found in image",
                 render_image: originalBase64,
-                resRegions: []
+                resRegions: [],
+                debug: "OCR returned no text"
             });
         }
 
         console.log(`📝 Extracted: ${ocrResult.text.substring(0, 100)}...`);
 
-        // Build resRegions with translated text and coords
+        // Build resRegions
         const resRegions = [];
         for (const line of ocrResult.lines) {
             const srcText = line.LineText.trim();
@@ -162,29 +217,41 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             });
         }
 
-        // Render translated text on image using Jimp
+        console.log(`📤 Found ${resRegions.length} regions to render`);
+
+        // Render
         console.log('🖌️ Rendering text on image...');
-        const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
+        const { renderedBuffer, errors } = await renderTextOnImage(req.file.buffer, resRegions);
         
         let renderImageBase64;
+        let debugMsg = null;
         if (renderedBuffer) {
             renderImageBase64 = renderedBuffer.toString('base64');
             console.log('✅ Image rendered successfully');
         } else {
-            // Fallback: return original image (Image-to-Text mode)
-            console.warn('⚠️ Rendering failed, returning original image with resRegions');
+            // Fallback: original image
             renderImageBase64 = originalBase64;
+            debugMsg = "Rendering failed, returning original image. Errors: " + errors.join('; ');
+            console.warn(`⚠️ ${debugMsg}`);
         }
 
-        res.json({
+        const response = {
             errorCode: 0,
             render_image: renderImageBase64,
             resRegions: resRegions
-        });
+        };
+        if (debugMsg) {
+            response.debug = debugMsg;
+        }
+        if (errors && errors.length > 0) {
+            response.renderErrors = errors;
+        }
+
+        res.json(response);
 
     } catch (err) {
         console.error("❌ Error:", err.message);
-        res.json({ errorCode: 1, msg: err.message });
+        res.json({ errorCode: 1, msg: err.message, stack: err.stack });
     }
 });
 
