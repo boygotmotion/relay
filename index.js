@@ -10,9 +10,8 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// LANGUAGE HELPERS
 function toGoogleLang(l) {
-    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "id": "id" };
+    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "id": "id", "ru": "ru", "de": "de" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
@@ -23,14 +22,13 @@ function toOCRLang(l) {
     return dict[s] || "eng";
 }
 
-// TRANSLATION LOGIC
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
         let tgt = toGoogleLang(t);
         const params = new URLSearchParams({ client: 'gtx', sl: src, tl: tgt, dt: 't', q: txt });
         const r = await axios.get(`https://translate.googleapis.com/translate_a/single?${params.toString()}`, {
-            timeout: 4000, // Short timeout to prevent Vercel crash
+            timeout: 10000,
             headers: { "User-Agent": "Mozilla/5.0" }
         });
         if (r.data && r.data[0]) return r.data[0].map(s => s[0]).join("").trim();
@@ -38,11 +36,9 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return txt; }
 }
 
-// OCR LOGIC
 async function extractTextWithOCR(imageBuffer, fromLang) {
     try {
         const formData = new FormData();
-        // NOTE: 'helloworld' is very slow. Get a free key at ocr.space to avoid timeouts.
         formData.append('apikey', 'helloworld'); 
         formData.append('file', imageBuffer, { filename: 'image.jpg' });
         formData.append('language', toOCRLang(fromLang));
@@ -51,7 +47,7 @@ async function extractTextWithOCR(imageBuffer, fromLang) {
 
         const response = await axios.post('https://api.ocr.space/parse/image', formData, {
             headers: formData.getHeaders(),
-            timeout: 8000 // Vercel hobby limit is 10s total
+            timeout: 60000 
         });
 
         if (response.data && response.data.OCRExitCode === 1) {
@@ -64,7 +60,6 @@ async function extractTextWithOCR(imageBuffer, fromLang) {
     } catch (e) { return null; }
 }
 
-// RENDERING LOGIC (The "Universal" Fix)
 async function renderTextOnImage(imageBuffer, regions) {
     const img = await loadImage(imageBuffer);
     const canvas = createCanvas(img.width, img.height);
@@ -77,51 +72,50 @@ async function renderTextOnImage(imageBuffer, regions) {
         const text = region.tranContent || '';
         if (!text || w <= 0 || h <= 0) continue;
 
-        // 1. Background Sampling (Surgical)
-        const pixelData = ctx.getImageData(Math.max(0, x), Math.max(0, y), 1, 1).data;
-        ctx.fillStyle = `rgb(${pixelData[0]},${pixelData[1]},${pixelData[2]})`;
-        ctx.fillRect(x, y, w, h);
+        const sampleX = Math.max(0, x - 2);
+        const sampleY = Math.max(0, y - 2);
+        const pixelData = ctx.getImageData(sampleX, sampleY, 1, 1).data;
+        const r = pixelData[0], g = pixelData[1], b = pixelData[2];
+        
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
 
-        // 2. Text Color (Luminance)
-        const brightness = (pixelData[0] * 0.299 + pixelData[1] * 0.587 + pixelData[2] * 0.114);
+        const brightness = (r * 0.299 + g * 0.587 + b * 0.114);
         ctx.fillStyle = brightness > 125 ? 'black' : 'white';
 
-        // 3. Font & Squeeze (Supports Chinese/Arabic if fonts exist on OS)
-        let fontSize = Math.floor(h * 0.8);
-        ctx.font = `${fontSize}px sans-serif`;
-        ctx.textBaseline = 'top';
+        let fontSize = Math.floor(h * 0.82); 
+        ctx.font = `${fontSize}px "Microsoft YaHei", "Malgun Gothic", "Meiryo", "Arial Unicode MS", "Arial", sans-serif`;
+        ctx.textBaseline = 'middle';
 
-        // 4. Draw with Horizontal Fit (The Squeeze Fix)
-        ctx.fillText(text, x, y, w); 
+        ctx.fillText(text, x, y + (h / 2), w); 
     }
 
     return canvas.toBuffer('image/jpeg');
 }
 
-// MAIN API ROUTE
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
     const { from = "auto", to = "zh" } = req.body;
 
     try {
-        // 1. OCR
         const ocr = await extractTextWithOCR(req.file.buffer, from);
-        if (!ocr) throw new Error("OCR Failed or Timed Out");
+        if (!ocr || !ocr.lines) throw new Error("OCR Failed");
 
-        // 2. Translate Lines
         const resRegions = [];
         for (const line of ocr.lines) {
             const dstText = await translateWithGoogle(line.LineText, from, to);
+            
             const first = line.Words[0];
             const last = line.Words[line.Words.length - 1];
+            const boxW = (last.Left + last.Width) - first.Left;
+            const boxH = line.MaxHeight;
             
             resRegions.push({
                 tranContent: dstText,
-                boundingBox: `${first.Left},${first.Top},${(last.Left + last.Width) - first.Left},${line.MaxHeight}`
+                boundingBox: `${first.Left},${first.Top},${boxW},${boxH}`
             });
         }
 
-        // 3. Render
         const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
         
         res.json({ 
@@ -131,14 +125,11 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         });
 
     } catch (err) { 
-        console.error(err.message);
-        // If it fails (timeout), return the original image so the app doesn't break
-        res.json({ 
-            errorCode: 0, 
-            render_image: req.file.buffer.toString('base64'), 
-            msg: "Process timed out, returning original" 
-        }); 
+        res.json({ errorCode: 1, msg: err.message }); 
     }
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT);
 
 export default app;
