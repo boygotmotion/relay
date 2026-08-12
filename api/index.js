@@ -10,6 +10,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// --- UTILS ---
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "ko": "ko", "fra": "fr", "spa": "es", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
@@ -38,23 +39,36 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return null; }
 }
 
+// --- MAIN ENDPOINT ---
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
-    console.log("📥 Request Received");
+    // 🔍 LOGGING: INCOMING DATA
+    console.log("\n" + "=".repeat(80));
+    console.log("📥 NEW PIXPIN REQUEST RECEIVED");
+    console.log("--------------------------------------------------");
+    console.log("1. HEADERS:", JSON.stringify(req.headers, null, 2));
+    console.log("2. QUERY PARAMS:", JSON.stringify(req.query, null, 2));
+    
+    if (req.file) console.log("3. BODY FIELDS: { image: [Buffer] }");
+
     const fromRequested = req.query.from || req.body.from || "auto";
     const toRequested = req.query.to || req.body.to || "zh";
 
-    if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
+    if (!req.file) return res.json({ errorCode: 1, msg: "No image file" });
 
     try {
         const tLang = getTessLang(fromRequested);
         const image = await Jimp.read(req.file.buffer);
 
-        // OCR
+        console.log(`   🔍 Starting OCR (Lang: ${tLang})...`);
         const ocrResult = await Tesseract.recognize(
             req.file.buffer,
             tLang,
-            { cachePath: '/tmp' }
+            { 
+                cachePath: '/tmp',
+                logger: m => console.log(`OCR Status: ${m.status}`) 
+            }
         );
+        console.log("\n   ✅ OCR Complete");
 
         const resRegions = [];
         let fragments = ocrResult.data.lines || ocrResult.data.words || [];
@@ -64,6 +78,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             const srcText = item.text.trim();
             if (srcText.length < 1) continue;
 
+            console.log(`   🔄 Processing Block ${i+1}...`);
             const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
 
             const b = item.bbox;
@@ -72,6 +87,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             const w = Math.round(b.x1 - b.x0);
             const h = Math.round(b.y1 - b.y0);
 
+            // Paint white box
             image.scan(x, y, w, h, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = 255;
                 this.bitmap.data[idx + 1] = 255;
@@ -87,14 +103,21 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         }
 
         const imageBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
-
-        res.json({
+        const finalResponse = {
             errorCode: 0,
             render_image: imageBuffer.toString("base64"),
             resRegions: resRegions
-        });
+        };
+
+        console.log("-".repeat(80));
+        console.log("📤 SENDING NATIVE JSON TO PIXPIN");
+        console.dir(finalResponse, { depth: 1, colors: true }); 
+        console.log("=".repeat(80));
+
+        res.json(finalResponse);
 
     } catch (err) {
+        console.error("   ❌ ERROR:", err.message);
         res.json({ errorCode: 1, msg: err.message });
     }
 });
