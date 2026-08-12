@@ -1,9 +1,11 @@
 {
+  "version": 2,
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/translate" }
+    { "source": "/api/trans/sdk/picture", "destination": "/index.js" },
+    { "source": "/(.*)", "destination": "/index.js" }
   ],
   "functions": {
-    "api/translate.js": {
+    "index.js": {
       "memory": 1024,
       "maxDuration": 10
     }
