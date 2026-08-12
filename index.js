@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
-import sharp from "sharp";
+import Jimp from "jimp";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -42,7 +42,7 @@ async function extractTextWithOCR(imageBuffer) {
         formData.append('language', 'eng');
         formData.append('OCREngine', '2');
         formData.append('scale', 'true');
-        formData.append('isOverlayRequired', 'true');
+        formData.append('isOverlayRequired', 'true'); // Get word-level coordinates
 
         const response = await axios.post('https://api.ocr.space/parse/image', formData, {
             headers: formData.getHeaders(),
@@ -65,45 +65,42 @@ async function extractTextWithOCR(imageBuffer) {
 
 async function renderTextOnImage(imageBuffer, regions) {
     try {
-        // Get image dimensions
-        const metadata = await sharp(imageBuffer).metadata();
-        const width = metadata.width;
-        const height = metadata.height;
-        console.log(`📐 Image dimensions: ${width}x${height}`);
-
-        // Build SVG with original image as background and text overlays
-        let svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
-        // Embed original image as base64 (optional; we can also composite later)
-        // We'll use composite instead, so we don't embed image in SVG.
-        // Instead, we'll create SVG with only text, then composite over original image.
-        // But we can also embed image in SVG for simplicity.
-        const base64Image = imageBuffer.toString('base64');
-        svg += `<image href="data:image/jpeg;base64,${base64Image}" width="${width}" height="${height}" />`;
-
+        const image = await Jimp.read(imageBuffer);
         for (const region of regions) {
             const [x, y, w, h] = region.boundingBox.split(',').map(Number);
-            if (w <= 0 || h <= 0 || x < 0 || y < 0) continue;
-            const text = region.tranContent || '';
-            if (!text) continue;
-
-            // Determine font size based on region height
-            const fontSize = Math.min(h * 0.8, 32);
-            // Escape text for SVG
-            const escapedText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            // Position text (top-left; adjust if needed)
-            svg += `<text x="${x + 5}" y="${y + fontSize}" font-family="Arial" font-size="${fontSize}" fill="black" font-weight="bold">${escapedText}</text>`;
+            // White background for text
+            image.scan(x, y, w, h, function(px, py, idx) {
+                this.bitmap.data[idx + 0] = 255;
+                this.bitmap.data[idx + 1] = 255;
+                this.bitmap.data[idx + 2] = 255;
+                this.bitmap.data[idx + 3] = 220;
+            });
+            // Draw translated text with built-in bitmap font
+            const font = Jimp.FONT_SANS_16_BLACK;
+            const text = region.tranContent;
+            // Wrap text to fit width
+            const maxWidth = w - 10;
+            const lines = [];
+            let currentLine = '';
+            const words = text.split(' ');
+            for (const word of words) {
+                if ((currentLine + ' ' + word).length * 8 < maxWidth) {
+                    currentLine += (currentLine ? ' ' : '') + word;
+                } else {
+                    if (currentLine) lines.push(currentLine);
+                    currentLine = word;
+                }
+            }
+            if (currentLine) lines.push(currentLine);
+            let lineY = y + 5;
+            for (const line of lines) {
+                image.print(font, x + 5, lineY, line);
+                lineY += 20;
+            }
         }
-        svg += '</svg>';
-
-        // Render SVG to PNG
-        const renderedBuffer = await sharp(Buffer.from(svg))
-            .png()
-            .toBuffer();
-
-        console.log(`✅ Rendered image size: ${renderedBuffer.length} bytes`);
-        return renderedBuffer;
+        return await image.getBufferAsync(Jimp.MIME_JPEG);
     } catch (err) {
-        console.error('❌ Render error:', err.message);
+        console.error('Render error:', err.message);
         return null;
     }
 }
@@ -131,6 +128,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
         console.log(`📝 Extracted: ${ocrResult.text.substring(0, 100)}...`);
 
+        // Build resRegions with translated text and coords
         const resRegions = [];
         for (const line of ocrResult.lines) {
             const srcText = line.LineText.trim();
@@ -154,6 +152,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             }
         }
 
+        // Fallback if no coords
         if (resRegions.length === 0 && ocrResult.text) {
             const dstText = (await translateWithGoogle(ocrResult.text, fromRequested, toRequested)) || ocrResult.text;
             resRegions.push({
@@ -163,9 +162,8 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             });
         }
 
-        console.log(`📤 Found ${resRegions.length} regions to render`);
-
-        // Render the image with text overlays
+        // Render translated text on image using Jimp
+        console.log('🖌️ Rendering text on image...');
         const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
         
         let renderImageBase64;
@@ -174,7 +172,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             console.log('✅ Image rendered successfully');
         } else {
             // Fallback: return original image (Image-to-Text mode)
-            console.warn('⚠️ Rendering failed, returning original image');
+            console.warn('⚠️ Rendering failed, returning original image with resRegions');
             renderImageBase64 = originalBase64;
         }
 
