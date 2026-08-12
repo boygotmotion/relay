@@ -9,7 +9,10 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
+// Add this after your other app.use() lines
+app.post("/", (req, res) => {
+    res.send("🚀 PixPin Native Relay is LIVE. Send POST to /api/trans/sdk/picture");
+});
 // --- UTILS ---
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "ko": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
