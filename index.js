@@ -2,7 +2,6 @@ const express = require("express");
 const axios = require("axios");
 const multer = require("multer");
 const Tesseract = require("tesseract.js");
-Tesseract.setCorePath("/tesseract-core-simd.wasm");
 const Jimp = require("jimp");
 
 const app = express();
@@ -10,13 +9,14 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-// Add this after your other app.use() lines
+
 app.post("/", (req, res) => {
     res.send("🚀 PixPin Native Relay is LIVE. Send POST to /api/trans/sdk/picture");
 });
+
 // --- UTILS ---
 function toGoogleLang(l) {
-    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "ko": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
+    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
@@ -54,18 +54,17 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const tLang = getTessLang(fromRequested);
         const image = await Jimp.read(req.file.buffer);
 
-        // OCR - Tesseract on Vercel requires /tmp
-        const ocrResult = await Tesseract.recognize(
-            req.file.buffer,
-            tLang,
-            { 
-                cachePath: '/tmp',
-                logger: m => console.log(`OCR: ${m.status}`) 
-            }
-        );
+        // ✅ Use createWorker with corePath
+        const worker = await Tesseract.createWorker(tLang, 1, {
+            corePath: '/tesseract-core-simd.wasm',  // ✅ Correct way in v5
+            cachePath: '/tmp'
+        });
+
+        const { data: { lines, words, text } } = await worker.recognize(req.file.buffer);
+        await worker.terminate();
 
         const resRegions = [];
-        let fragments = ocrResult.data.lines || ocrResult.data.words || [];
+        let fragments = lines || words || [];
 
         for (let i = 0; i < fragments.length; i++) {
             const item = fragments[i];
@@ -91,7 +90,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             resRegions.push({
                 context: srcText,
                 tranContent: dstText,
-                boundingBox: `${x},${y},${w},${h}` // Commas required
+                boundingBox: `${x},${y},${w},${h}`
             });
         }
 
