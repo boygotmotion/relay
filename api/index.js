@@ -10,9 +10,8 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- UTILS ---
 function toGoogleLang(l) {
-    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "ko": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
+    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "ko": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
@@ -39,11 +38,8 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return null; }
 }
 
-// --- PIXPIN ENDPOINT ---
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     console.log("\n📥 NEW PIXPIN REQUEST RECEIVED");
-    console.log("Headers:", JSON.stringify(req.headers));
-
     const fromRequested = req.query.from || req.body.from || "auto";
     const toRequested = req.query.to || req.body.to || "zh";
 
@@ -53,12 +49,11 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const tLang = getTessLang(fromRequested);
         const image = await Jimp.read(req.file.buffer);
 
-        console.log(`🔍 Starting OCR (Lang: ${tLang})...`);
         const ocrResult = await Tesseract.recognize(
             req.file.buffer,
             tLang,
             { 
-                cachePath: '/tmp',
+                cachePath: '/tmp', // Critical for Vercel
                 logger: m => console.log(`OCR: ${m.status}`) 
             }
         );
@@ -72,7 +67,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             if (srcText.length < 1) continue;
 
             const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
-            console.log(`✅ Translated: ${srcText.substring(0,10)} -> ${dstText.substring(0,10)}`);
+            console.log(`Translated: ${srcText.substring(0,10)} -> ${dstText.substring(0,10)}`);
 
             const b = item.bbox;
             const x = Math.round(b.x0);
@@ -80,7 +75,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             const w = Math.round(b.x1 - b.x0);
             const h = Math.round(b.y1 - b.y0);
 
-            // Paint background for PixPin interface
             image.scan(x, y, w, h, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = 255;
                 this.bitmap.data[idx + 1] = 255;
@@ -91,13 +85,12 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             resRegions.push({
                 context: srcText,
                 tranContent: dstText,
-                boundingBox: `${x},${y},${w},${h}`
+                boundingBox: `${x},${y},${w},${h}` // Use commas per Ghidra decompilation
             });
         }
 
         const imageBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
 
-        console.log("📤 SENDING SUCCESS TO PIXPIN");
         res.json({
             errorCode: 0,
             render_image: imageBuffer.toString("base64"),
