@@ -54,17 +54,18 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const tLang = getTessLang(fromRequested);
         const image = await Jimp.read(req.file.buffer);
 
-        // ✅ Use createWorker with corePath
-        const worker = await Tesseract.createWorker(tLang, 1, {
-            corePath: '/tesseract-core-simd.wasm',  // ✅ Correct way in v5
-            cachePath: '/tmp'
-        });
-
-        const { data: { lines, words, text } } = await worker.recognize(req.file.buffer);
-        await worker.terminate();
+        // ✅ Tesseract.js v4 API
+        const result = await Tesseract.recognize(
+            req.file.buffer,
+            tLang,
+            {
+                cachePath: '/tmp',
+                logger: m => console.log(`OCR: ${m.status}`)
+            }
+        );
 
         const resRegions = [];
-        let fragments = lines || words || [];
+        let fragments = result.data.lines || result.data.words || [];
 
         for (let i = 0; i < fragments.length; i++) {
             const item = fragments[i];
