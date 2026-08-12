@@ -2,6 +2,7 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
+import path from "path";
 import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
 const app = express();
@@ -9,6 +10,17 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// --- CJK FONT BUNDLED WITH PROJECT ---
+// process.cwd() points to the root of your project on Vercel
+const FONT_PATH = path.join(process.cwd(), "fonts", "NotoSansCJKsc-Regular.otf");
+
+// Register the font once when the server starts
+try {
+    GlobalFonts.registerFromPath(FONT_PATH, "NotoSansCJK");
+} catch (e) {
+    console.error("Font registration failed. Check if the file is in /fonts/");
+}
 
 // 1. LANGUAGE MAPPING
 function toGoogleLang(l) {
@@ -23,7 +35,7 @@ function toOCRLang(l) {
     return dict[s] || "eng";
 }
 
-// 2. TRANSLATION (Google gtx)
+// 2. TRANSLATION
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
@@ -38,7 +50,7 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return txt; }
 }
 
-// 3. OCR (OCR.space)
+// 3. OCR
 async function extractTextWithOCR(imageBuffer, fromLang) {
     try {
         const formData = new FormData();
@@ -63,7 +75,7 @@ async function extractTextWithOCR(imageBuffer, fromLang) {
     } catch (e) { return null; }
 }
 
-// 4. IMPROVED RENDERING (Fixes "Made-up Background" issue)
+// 4. RENDERING
 async function renderTextOnImage(imageBuffer, regions) {
     const img = await loadImage(imageBuffer);
     const canvas = createCanvas(img.width, img.height);
@@ -76,29 +88,21 @@ async function renderTextOnImage(imageBuffer, regions) {
         const text = region.tranContent || '';
         if (!text || w <= 0 || h <= 0) continue;
 
-        // A. SMART BACKGROUND SAMPLING
-        // We sample slightly outside the box (offset by 2 pixels) to avoid picking up the old text's anti-aliasing
         const sampleX = Math.max(0, x - 2);
         const sampleY = Math.max(0, y - 2);
         const pixelData = ctx.getImageData(sampleX, sampleY, 1, 1).data;
         const r = pixelData[0], g = pixelData[1], b = pixelData[2];
         
-        // B. CLEAN COVER-UP
-        // We fill the area with the sampled color
         ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(x - 1, y - 1, w + 2, h + 2); // Slight expansion to ensure full coverage
+        ctx.fillRect(x - 1, y - 1, w + 2, h + 2); 
 
-        // C. TEXT COLOR CONTRAST
         const brightness = (r * 0.299 + g * 0.587 + b * 0.114);
         ctx.fillStyle = brightness > 125 ? 'black' : 'white';
 
-        // D. FONT & SQUEEZE (CJK FIX)
         let fontSize = Math.floor(h * 0.82); 
-        ctx.font = `${fontSize}px "Microsoft YaHei", "Malgun Gothic", "Meiryo", "Arial Unicode MS", "Arial", sans-serif`;
+        ctx.font = `${fontSize}px "NotoSansCJK"`; // Match the registered name
         ctx.textBaseline = 'middle';
 
-        // E. THE SQUEEZE
-        // The 4th parameter 'w' prevents text from leaking out of its designated area
         ctx.fillText(text, x, y + (h / 2), w); 
     }
 
@@ -107,7 +111,6 @@ async function renderTextOnImage(imageBuffer, regions) {
 
 // 5. API ENDPOINT
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
-    console.log(`[${new Date().toLocaleTimeString()}] Processing Request...`);
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
     const { from = "auto", to = "zh" } = req.body;
 
@@ -118,21 +121,16 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const resRegions = [];
         for (const line of ocr.lines) {
             const dstText = await translateWithGoogle(line.LineText, from, to);
-            
             const first = line.Words[0];
             const last = line.Words[line.Words.length - 1];
-            const boxW = (last.Left + last.Width) - first.Left;
-            const boxH = line.MaxHeight;
-            
             resRegions.push({
                 tranContent: dstText,
-                boundingBox: `${first.Left},${first.Top},${boxW},${boxH}`
+                boundingBox: `${first.Left},${first.Top},${(last.Left + last.Width) - first.Left},${line.MaxHeight}`
             });
         }
 
         const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
         
-        console.log(`[SUCCESS] Translated to ${to}. Sending image...`);
         res.json({ 
             errorCode: 0, 
             render_image: renderedBuffer.toString('base64'), 
@@ -140,15 +138,8 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         });
 
     } catch (err) { 
-        console.error("[ERROR]", err.message);
         res.json({ errorCode: 1, msg: err.message }); 
     }
 });
 
-const PORT = 3000;
-app.listen(PORT, () => {
-    console.log(`=========================================`);
-    console.log(`CJK & BACKGROUND-FIXED ENGINE RUNNING`);
-    console.log(`URL: http://localhost:${PORT}/api/trans/sdk/picture`);
-    console.log(`=========================================`);
-});
+export default app;
