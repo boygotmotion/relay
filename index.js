@@ -1,8 +1,11 @@
 const express = require("express");
 const axios = require("axios");
 const multer = require("multer");
+const { OCRClient } = require("ya-ocr");
+const svg2img = require("svg2img");
 const Jimp = require("jimp");
-const FormData = require("form-data");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -14,49 +17,7 @@ app.post("/", (req, res) => {
     res.send("🚀 PixPin Native Relay is LIVE. Send POST to /api/trans/sdk/picture");
 });
 
-function toGoogleLang(l) {
-    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
-    let s = String(l).toLowerCase();
-    return dict[s] || s;
-}
-
-async function translateWithGoogle(txt, f, t) {
-    try {
-        let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
-        let tgt = toGoogleLang(t);
-        const params = new URLSearchParams({ client: 'gtx', sl: src, tl: tgt, dt: 't', q: txt });
-        const r = await axios.get(`https://translate.googleapis.com/translate_a/single?${params.toString()}`, {
-            timeout: 4000,
-            headers: { "User-Agent": "Mozilla/5.0" }
-        });
-        if (r.data && r.data[0]) return r.data[0].map(s => s[0]).join("").trim();
-        return null;
-    } catch (e) { return null; }
-}
-
-async function extractTextWithOCR(imageBuffer) {
-    try {
-        const formData = new FormData();
-        formData.append('apikey', 'helloworld');
-        formData.append('file', imageBuffer, { filename: 'image.jpg' });
-        formData.append('language', 'eng');
-        formData.append('OCREngine', '2');
-
-        const response = await axios.post('https://api.ocr.space/parse/image', formData, {
-            headers: formData.getHeaders(),
-            timeout: 15000
-        });
-
-        if (response.data && response.data.OCRExitCode === 1) {
-            return response.data.ParsedResults[0].ParsedText.trim();
-        }
-        return null;
-    } catch (e) {
-        console.error('OCR Exception:', e.message);
-        return null;
-    }
-}
-
+// --- MAIN ENDPOINT ---
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     const fromRequested = req.query.from || req.body.from || "auto";
     const toRequested = req.query.to || req.body.to || "zh";
@@ -64,75 +25,49 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
 
     try {
-        const image = await Jimp.read(req.file.buffer);
-        const width = image.bitmap.width;
-        const height = image.bitmap.height;
+        // Step 1: Save the uploaded image to /tmp (Vercel's temp directory)
+        const tempPath = `/tmp/upload_${Date.now()}.jpg`;
+        fs.writeFileSync(tempPath, req.file.buffer);
 
-        console.log('🔍 Running OCR...');
-        const extractedText = await extractTextWithOCR(req.file.buffer);
+        // Step 2: Upload to a temporary public URL (ya-ocr requires URL)
+        // Option A: Use a free image hosting service via API
+        // Option B: Use your own Vercel endpoint to serve the image
+        // For now, we'll use imgbb.com (free, no registration)
+        const formData = new FormData();
+        formData.append('image', req.file.buffer.toString('base64'));
         
-        if (!extractedText) {
-            return res.json({ 
-                errorCode: 1, 
-                msg: "No text found in image",
-                render_image: req.file.buffer.toString("base64"),
-                resRegions: []
-            });
-        }
-        
-        console.log(`📝 Extracted: ${extractedText.substring(0, 100)}...`);
-
-        const dstText = (await translateWithGoogle(extractedText, fromRequested, toRequested)) || extractedText;
-        console.log(`📝 Translated: ${dstText.substring(0, 100)}...`);
-
-        const padding = 20;
-        const x = padding;
-        const y = padding;
-        const maxWidth = width - (padding * 2);
-        const textBgHeight = Math.min(120, height - (padding * 2));
-
-        // Paint white background
-        image.scan(x, y, maxWidth, textBgHeight, function(px, py, idx) {
-            this.bitmap.data[idx + 0] = 255;
-            this.bitmap.data[idx + 1] = 255;
-            this.bitmap.data[idx + 2] = 255;
-            this.bitmap.data[idx + 3] = 200;
+        const uploadResponse = await axios.post('https://api.imgbb.com/1/upload', formData, {
+            headers: formData.getHeaders(),
+            params: { key: 'YOUR_IMGBB_API_KEY' } // Get free key from imgbb.com
         });
 
-        // ✅ FIX: Use Jimp's built-in font (FONT_SANS_32_BLACK is available)
-        const font = await Jimp.loadFont(Jimp.FONT_SANS_32_BLACK);
-        
-        // Split text into lines manually if wrapText fails
-        const maxCharsPerLine = Math.floor((maxWidth - 20) / 16);
-        const lines = [];
-        let currentLine = '';
-        const words = dstText.split(' ');
-        for (const word of words) {
-            if ((currentLine + ' ' + word).length <= maxCharsPerLine) {
-                currentLine += (currentLine ? ' ' : '') + word;
-            } else {
-                if (currentLine) lines.push(currentLine);
-                currentLine = word;
-            }
-        }
-        if (currentLine) lines.push(currentLine);
+        const imageUrl = uploadResponse.data.data.url;
+        console.log(`📤 Image uploaded to: ${imageUrl}`);
 
-        // Draw each line
-        const lineHeight = 36;
-        let currentY = y + 10;
-        for (const line of lines) {
-            if (currentY + lineHeight > y + textBgHeight - 10) break;
-            image.print(font, x + 10, currentY, line, maxWidth - 20, lineHeight);
-            currentY += lineHeight;
-        }
+        // Step 3: Run ya-ocr with translation
+        const client = new OCRClient({ withTranslate: true });
+        const result = await client.scanByUrl(imageUrl);
 
-        const imageBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
-        const base64Image = imageBuffer.toString("base64");
+        console.log(`📝 Extracted: ${result.text.substring(0, 100)}...`);
+        console.log(`📝 Translated: ${result.translatedText.substring(0, 100)}...`);
 
+        // Step 4: Convert SVG to image
+        const svgData = result.svg;
+        const pngBuffer = await new Promise((resolve, reject) => {
+            svg2img(svgData, (error, buffer) => {
+                if (error) reject(error);
+                else resolve(buffer);
+            });
+        });
+
+        // Step 5: Return the rendered image as base64
+        const base64Image = pngBuffer.toString('base64');
+
+        // Step 6: Build the response
         const resRegions = [{
-            context: extractedText.substring(0, 200),
-            tranContent: dstText.substring(0, 200),
-            boundingBox: `${x},${y},${maxWidth},${textBgHeight}`
+            context: result.text.substring(0, 200),
+            tranContent: result.translatedText.substring(0, 200),
+            boundingBox: `0,0,${result.width || 800},${result.height || 600}`
         }];
 
         res.json({
@@ -143,6 +78,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
     } catch (err) {
         console.error("❌ Error:", err.message);
+        console.error("Stack:", err.stack);
         res.json({ errorCode: 1, msg: err.message });
     }
 });
