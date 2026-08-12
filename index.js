@@ -20,6 +20,12 @@ function toGoogleLang(l) {
     return dict[s] || s;
 }
 
+// Determine if the target language needs a custom font (non‑Latin)
+function needsCustomFont(lang) {
+    const nonLatin = ['zh', 'ja', 'ko', 'ar', 'th'];
+    return nonLatin.includes(lang);
+}
+
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
@@ -63,21 +69,18 @@ async function extractTextWithOCR(imageBuffer) {
     }
 }
 
+// Only used for Latin languages
 async function renderTextOnImage(imageBuffer, regions) {
     try {
         const metadata = await sharp(imageBuffer).metadata();
         const width = metadata.width;
         const height = metadata.height;
 
-        // Build SVG with system font (Arial)
         let svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
         svg += `<style>text { font-family: Arial, sans-serif; }</style>`;
-
-        // Embed original image as base64
         const imgBase64 = imageBuffer.toString('base64');
         svg += `<image href="data:image/jpeg;base64,${imgBase64}" width="${width}" height="${height}" />`;
 
-        // Add text overlays
         for (const region of regions) {
             const [x, y, w, h] = region.boundingBox.split(',').map(Number);
             if (w <= 0 || h <= 0 || x < 0 || y < 0) continue;
@@ -85,14 +88,13 @@ async function renderTextOnImage(imageBuffer, regions) {
             if (!text) continue;
 
             let fontSize = Math.min(h * 0.8, 64);
-            const avgCharWidth = fontSize * 0.6;
-            let textWidth = text.length * avgCharWidth;
+            // For Latin, text width is proportional to length
+            let textWidth = text.length * fontSize * 0.6;
             while (textWidth > w - 10 && fontSize > 8) {
                 fontSize -= 2;
                 textWidth = text.length * fontSize * 0.6;
             }
 
-            // Word wrap
             const words = text.split(' ');
             let lines = [];
             let currentLine = '';
@@ -113,7 +115,6 @@ async function renderTextOnImage(imageBuffer, regions) {
             let startY = y + (h - totalTextHeight) / 2 + fontSize * 0.8;
             if (startY < y) startY = y + fontSize;
 
-            // Use black with white stroke for readability
             for (let i = 0; i < lines.length; i++) {
                 const line = lines[i];
                 const lineWidth = line.length * fontSize * 0.6;
@@ -122,17 +123,11 @@ async function renderTextOnImage(imageBuffer, regions) {
                 svg += `<text x="${startX}" y="${lineY}" font-size="${fontSize}" fill="black" stroke="white" stroke-width="1.5" font-weight="bold">${escapeXML(line)}</text>`;
             }
         }
-
         svg += '</svg>';
 
-        const renderedBuffer = await sharp(Buffer.from(svg))
-            .png()
-            .toBuffer();
-
-        console.log(`✅ Rendered image size: ${renderedBuffer.length} bytes`);
+        const renderedBuffer = await sharp(Buffer.from(svg)).png().toBuffer();
         return { renderedBuffer, errors: [] };
     } catch (err) {
-        console.error('❌ Render error:', err.message);
         return { renderedBuffer: null, errors: [err.message] };
     }
 }
@@ -191,19 +186,27 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             });
         }
 
-        console.log(`📤 Found ${resRegions.length} regions to render`);
-
-        const { renderedBuffer, errors } = await renderTextOnImage(req.file.buffer, resRegions);
-
+        // ----- HYBRID MODE -----
         let renderImageBase64;
         let debugMsg = null;
-        if (renderedBuffer) {
-            renderImageBase64 = renderedBuffer.toString('base64');
-            console.log('✅ Image rendered successfully');
-        } else {
+
+        if (needsCustomFont(toRequested)) {
+            // Non‑Latin: return original image + resRegions (Image‑to‑Text)
             renderImageBase64 = originalBase64;
-            debugMsg = "Rendering failed, returning original image. Errors: " + errors.join('; ');
-            console.warn(`⚠️ ${debugMsg}`);
+            debugMsg = "Non‑Latin language – PixPin will render locally";
+            console.log(`ℹ️ ${debugMsg}`);
+        } else {
+            // Latin: render with Arial
+            console.log(`📤 Rendering Latin text on image...`);
+            const { renderedBuffer, errors } = await renderTextOnImage(req.file.buffer, resRegions);
+            if (renderedBuffer) {
+                renderImageBase64 = renderedBuffer.toString('base64');
+                console.log('✅ Image rendered successfully');
+            } else {
+                renderImageBase64 = originalBase64;
+                debugMsg = "Rendering failed, returning original image. Errors: " + errors.join('; ');
+                console.warn(`⚠️ ${debugMsg}`);
+            }
         }
 
         const response = {
@@ -212,7 +215,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             resRegions: resRegions
         };
         if (debugMsg) response.debug = debugMsg;
-        if (errors && errors.length > 0) response.renderErrors = errors;
 
         res.json(response);
 
