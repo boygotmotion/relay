@@ -10,47 +10,40 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/**
- * FONT NOTE: 
- * Vercel servers have very few fonts. To render Chinese, Japanese, or Arabic,
- * you should place a .ttf file (like NotoSans-Regular.ttf) in your project folder
- * and uncomment the line below:
- * 
- * GlobalFonts.registerFromPath('./NotoSans-Regular.ttf', 'GlobalFont');
- */
-
-// Helper: Map standard codes to Google Translate codes
+// LANGUAGE HELPERS
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "id": "id" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
 
-// Helper: Map standard codes to OCR.space codes
 function toOCRLang(l) {
-    const dict = { "zh": "chs", "jp": "jpn", "ko": "kor", "fra": "fre", "spa": "spa", "ara": "ara", "de": "ger" };
+    const dict = { "zh": "chs", "jp": "jpn", "ko": "kor", "fra": "fre", "spa": "spa", "ara": "ara" };
     let s = String(l).toLowerCase();
     return dict[s] || "eng";
 }
 
+// TRANSLATION LOGIC
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
         let tgt = toGoogleLang(t);
         const params = new URLSearchParams({ client: 'gtx', sl: src, tl: tgt, dt: 't', q: txt });
         const r = await axios.get(`https://translate.googleapis.com/translate_a/single?${params.toString()}`, {
-            timeout: 5000,
+            timeout: 4000, // Short timeout to prevent Vercel crash
             headers: { "User-Agent": "Mozilla/5.0" }
         });
         if (r.data && r.data[0]) return r.data[0].map(s => s[0]).join("").trim();
-        return null;
-    } catch (e) { return null; }
+        return txt;
+    } catch (e) { return txt; }
 }
 
+// OCR LOGIC
 async function extractTextWithOCR(imageBuffer, fromLang) {
     try {
         const formData = new FormData();
-        formData.append('apikey', 'helloworld'); // Replace 'helloworld' with your actual OCR.space API key
+        // NOTE: 'helloworld' is very slow. Get a free key at ocr.space to avoid timeouts.
+        formData.append('apikey', 'helloworld'); 
         formData.append('file', imageBuffer, { filename: 'image.jpg' });
         formData.append('language', toOCRLang(fromLang));
         formData.append('OCREngine', '2');
@@ -58,7 +51,7 @@ async function extractTextWithOCR(imageBuffer, fromLang) {
 
         const response = await axios.post('https://api.ocr.space/parse/image', formData, {
             headers: formData.getHeaders(),
-            timeout: 15000
+            timeout: 8000 // Vercel hobby limit is 10s total
         });
 
         if (response.data && response.data.OCRExitCode === 1) {
@@ -71,12 +64,12 @@ async function extractTextWithOCR(imageBuffer, fromLang) {
     } catch (e) { return null; }
 }
 
+// RENDERING LOGIC (The "Universal" Fix)
 async function renderTextOnImage(imageBuffer, regions) {
     const img = await loadImage(imageBuffer);
     const canvas = createCanvas(img.width, img.height);
     const ctx = canvas.getContext('2d');
 
-    // 1. Draw original image
     ctx.drawImage(img, 0, 0);
 
     for (const region of regions) {
@@ -84,72 +77,51 @@ async function renderTextOnImage(imageBuffer, regions) {
         const text = region.tranContent || '';
         if (!text || w <= 0 || h <= 0) continue;
 
-        // 2. SURGICAL BACKGROUND (Pixel Sampling)
-        // Sample color from the top-left edge of the box to cover old text
-        const pixelData = ctx.getImageData(Math.max(0, x - 1), Math.max(0, y - 1), 1, 1).data;
-        const r = pixelData[0], g = pixelData[1], b = pixelData[2];
-        
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        // 1. Background Sampling (Surgical)
+        const pixelData = ctx.getImageData(Math.max(0, x), Math.max(0, y), 1, 1).data;
+        ctx.fillStyle = `rgb(${pixelData[0]},${pixelData[1]},${pixelData[2]})`;
         ctx.fillRect(x, y, w, h);
 
-        // 3. COLOR SELECTION (Luminance check)
-        const brightness = (r * 0.299 + g * 0.587 + b * 0.114);
-        const textColor = brightness > 125 ? 'black' : 'white';
+        // 2. Text Color (Luminance)
+        const brightness = (pixelData[0] * 0.299 + pixelData[1] * 0.587 + pixelData[2] * 0.114);
+        ctx.fillStyle = brightness > 125 ? 'black' : 'white';
 
-        // 4. DYNAMIC FONT CALCULATION
-        // We set font size to roughly 75% of the box height
-        let fontSize = Math.floor(h * 0.75); 
-        ctx.font = `${fontSize}px sans-serif`; // Use 'GlobalFont' if you registered one above
-        ctx.fillStyle = textColor;
-        ctx.textBaseline = 'middle';
+        // 3. Font & Squeeze (Supports Chinese/Arabic if fonts exist on OS)
+        let fontSize = Math.floor(h * 0.8);
+        ctx.font = `${fontSize}px sans-serif`;
+        ctx.textBaseline = 'top';
 
-        // 5. THE "SQUEEZE" FIX
-        // Canvas fillText has a 4th parameter: maxWidth. 
-        // If the text is wider than 'w', Canvas will automatically compress the characters.
-        const metrics = ctx.measureText(text);
-        if (metrics.width > w) {
-            ctx.fillText(text, x, y + (h / 2), w); 
-        } else {
-            ctx.fillText(text, x, y + (h / 2));
-        }
+        // 4. Draw with Horizontal Fit (The Squeeze Fix)
+        ctx.fillText(text, x, y, w); 
     }
 
     return canvas.toBuffer('image/jpeg');
 }
 
+// MAIN API ROUTE
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
-    if (!req.file) return res.json({ errorCode: 1, msg: "No image provided" });
+    if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
     const { from = "auto", to = "zh" } = req.body;
 
     try {
-        // Step 1: Perform OCR
+        // 1. OCR
         const ocr = await extractTextWithOCR(req.file.buffer, from);
-        
-        if (!ocr || !ocr.text) {
-            return res.json({ 
-                errorCode: 0, 
-                render_image: req.file.buffer.toString('base64'), 
-                resRegions: [] 
-            });
-        }
+        if (!ocr) throw new Error("OCR Failed or Timed Out");
 
-        // Step 2: Translate each detected line
+        // 2. Translate Lines
         const resRegions = [];
         for (const line of ocr.lines) {
-            const dstText = await translateWithGoogle(line.LineText, from, to) || line.LineText;
-            
-            // Calculate bounding box based on word positions
+            const dstText = await translateWithGoogle(line.LineText, from, to);
             const first = line.Words[0];
             const last = line.Words[line.Words.length - 1];
-            const boxW = (last.Left + last.Width) - first.Left;
             
             resRegions.push({
                 tranContent: dstText,
-                boundingBox: `${first.Left},${first.Top},${boxW},${line.MaxHeight}`
+                boundingBox: `${first.Left},${first.Top},${(last.Left + last.Width) - first.Left},${line.MaxHeight}`
             });
         }
 
-        // Step 3: Render the translated text back onto the image
+        // 3. Render
         const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
         
         res.json({ 
@@ -159,13 +131,14 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         });
 
     } catch (err) { 
-        console.error("Internal Error:", err);
-        res.status(500).json({ errorCode: 1, msg: err.message }); 
+        console.error(err.message);
+        // If it fails (timeout), return the original image so the app doesn't break
+        res.json({ 
+            errorCode: 0, 
+            render_image: req.file.buffer.toString('base64'), 
+            msg: "Process timed out, returning original" 
+        }); 
     }
 });
-
-// Port handling for local and production (Vercel)
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 export default app;
