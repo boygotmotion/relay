@@ -54,12 +54,13 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const tLang = getTessLang(fromRequested);
         const image = await Jimp.read(req.file.buffer);
 
-        // ✅ Tesseract.js v4 API
+        // ✅ Force Tesseract to use CDN for WASM core
         const result = await Tesseract.recognize(
             req.file.buffer,
             tLang,
             {
                 cachePath: '/tmp',
+                corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.0/tesseract-core-simd.wasm',
                 logger: m => console.log(`OCR: ${m.status}`)
             }
         );
@@ -80,7 +81,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             const w = Math.round(b.x1 - b.x0);
             const h = Math.round(b.y1 - b.y0);
 
-            // Paint white box to cover original text
             image.scan(x, y, w, h, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = 255;
                 this.bitmap.data[idx + 1] = 255;
