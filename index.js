@@ -1,14 +1,11 @@
 const express = require("express");
 const axios = require("axios");
 const multer = require("multer");
-const { OCRClient } = require("ya-ocr");
-const { Converter } = require("svg-to-png");
 const FormData = require("form-data");
 const fs = require("fs");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
-const converter = new Converter();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -24,13 +21,20 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
 
     try {
-        // Upload to imgbb (free, no registration)
+        // ✅ Dynamic import for ya-ocr (ES Module)
+        const { OCRClient } = await import('ya-ocr');
+        
+        // ✅ Dynamic import for svg-to-png (ES Module)
+        const { Converter } = await import('svg-to-png');
+        const converter = new Converter();
+
+        // Upload to imgbb with your API key
         const formData = new FormData();
         formData.append('image', req.file.buffer.toString('base64'));
 
         const uploadResponse = await axios.post('https://api.imgbb.com/1/upload', formData, {
             headers: formData.getHeaders(),
-            params: { key: '3d82321f5628ca768792c1c1d0297ca3' } // Get free key from imgbb.com
+            params: { key: '3d82321f5628ca768792c1c1d0297ca3' }
         });
 
         const imageUrl = uploadResponse.data.data.url;
@@ -40,8 +44,8 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const client = new OCRClient({ withTranslate: true });
         const result = await client.scanByUrl(imageUrl);
 
-        console.log(`📝 Extracted: ${result.text.substring(0, 100)}...`);
-        console.log(`📝 Translated: ${result.translatedText.substring(0, 100)}...`);
+        console.log(`📝 Extracted: ${result.text ? result.text.substring(0, 100) : 'No text'}...`);
+        console.log(`📝 Translated: ${result.translatedText ? result.translatedText.substring(0, 100) : 'No translation'}...`);
 
         // Convert SVG to PNG
         const pngBuffer = await converter.convert(result.svg);
@@ -50,8 +54,8 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const base64Image = pngBuffer.toString('base64');
 
         const resRegions = [{
-            context: result.text.substring(0, 200),
-            tranContent: result.translatedText.substring(0, 200),
+            context: result.text ? result.text.substring(0, 200) : '',
+            tranContent: result.translatedText ? result.translatedText.substring(0, 200) : '',
             boundingBox: `0,0,${result.width || 800},${result.height || 600}`
         }];
 
@@ -63,6 +67,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
     } catch (err) {
         console.error("❌ Error:", err.message);
+        console.error("Stack:", err.stack);
         res.json({ errorCode: 1, msg: err.message });
     }
 });
