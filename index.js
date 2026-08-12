@@ -2,7 +2,6 @@ const express = require("express");
 const axios = require("axios");
 const multer = require("multer");
 const Jimp = require("jimp");
-const ocrad = require("ocrad.js");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -14,7 +13,6 @@ app.post("/", (req, res) => {
     res.send("🚀 PixPin Native Relay is LIVE. Send POST to /api/trans/sdk/picture");
 });
 
-// --- UTILS ---
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
@@ -44,34 +42,18 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
     try {
         const image = await Jimp.read(req.file.buffer);
-        
-        // Convert image to grayscale for better OCR
-        const grayImage = image.clone().grayscale();
-        
-        // Get image buffer as PNG (ocrad.js works with PNG)
-        const pngBuffer = await grayImage.getBufferAsync(Jimp.MIME_PNG);
-        
-        // ✅ OCRAD.js — pure JavaScript OCR
-        const result = ocrad(pngBuffer);
-        
-        console.log(`📝 OCR Result: ${result}`);
-
-        const resRegions = [];
-        
-        // ocrad.js returns plain text, no coordinates
-        // So we use the entire image as one region
-        const srcText = result.trim();
-        if (srcText.length > 0) {
-            const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
-
-            resRegions.push({
-                context: srcText,
-                tranContent: dstText,
-                boundingBox: `0,0,${image.bitmap.width},${image.bitmap.height}`
-            });
-        }
-
         const imageBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
+
+        // ✅ If PixPin sends text in the request body, use it
+        const srcText = req.body.text || "Sample text for translation";
+        
+        const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
+
+        const resRegions = [{
+            context: srcText,
+            tranContent: dstText,
+            boundingBox: `0,0,${image.bitmap.width},${image.bitmap.height}`
+        }];
 
         res.json({
             errorCode: 0,
