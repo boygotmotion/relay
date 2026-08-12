@@ -1,12 +1,6 @@
 {
+  "version": 2,
   "rewrites": [
-    { "source": "/api/trans/sdk/picture", "destination": "/api/index" },
     { "source": "/(.*)", "destination": "/api/index" }
-  ],
-  "functions": {
-    "api/index.js": {
-      "memory": 1024,
-      "maxDuration": 10
-    }
-  }
+  ]
 }
