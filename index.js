@@ -3,6 +3,7 @@ import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
 import sharp from "sharp";
+import OCRClient from 'ya-ocr';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -32,7 +33,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         console.log(`📤 Image uploaded to: ${imageUrl}`);
 
         // 2. Run ya-ocr with translation
-        const { OCRClient } = await import('ya-ocr');
         const client = new OCRClient({ withTranslate: true });
         const result = await client.scanByUrl(imageUrl);
 
