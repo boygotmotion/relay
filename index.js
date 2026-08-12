@@ -2,6 +2,7 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
+import sharp from "sharp";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -62,6 +63,51 @@ async function extractTextWithOCR(imageBuffer) {
     }
 }
 
+async function renderTextOnImage(imageBuffer, regions) {
+    try {
+        // Get image dimensions
+        const metadata = await sharp(imageBuffer).metadata();
+        const width = metadata.width;
+        const height = metadata.height;
+        console.log(`📐 Image dimensions: ${width}x${height}`);
+
+        // Build SVG with original image as background and text overlays
+        let svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
+        // Embed original image as base64 (optional; we can also composite later)
+        // We'll use composite instead, so we don't embed image in SVG.
+        // Instead, we'll create SVG with only text, then composite over original image.
+        // But we can also embed image in SVG for simplicity.
+        const base64Image = imageBuffer.toString('base64');
+        svg += `<image href="data:image/jpeg;base64,${base64Image}" width="${width}" height="${height}" />`;
+
+        for (const region of regions) {
+            const [x, y, w, h] = region.boundingBox.split(',').map(Number);
+            if (w <= 0 || h <= 0 || x < 0 || y < 0) continue;
+            const text = region.tranContent || '';
+            if (!text) continue;
+
+            // Determine font size based on region height
+            const fontSize = Math.min(h * 0.8, 32);
+            // Escape text for SVG
+            const escapedText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            // Position text (top-left; adjust if needed)
+            svg += `<text x="${x + 5}" y="${y + fontSize}" font-family="Arial" font-size="${fontSize}" fill="black" font-weight="bold">${escapedText}</text>`;
+        }
+        svg += '</svg>';
+
+        // Render SVG to PNG
+        const renderedBuffer = await sharp(Buffer.from(svg))
+            .png()
+            .toBuffer();
+
+        console.log(`✅ Rendered image size: ${renderedBuffer.length} bytes`);
+        return renderedBuffer;
+    } catch (err) {
+        console.error('❌ Render error:', err.message);
+        return null;
+    }
+}
+
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     const fromRequested = req.query.from || req.body.from || "auto";
     const toRequested = req.query.to || req.body.to || "zh";
@@ -108,7 +154,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             }
         }
 
-        // Fallback if no coords
         if (resRegions.length === 0 && ocrResult.text) {
             const dstText = (await translateWithGoogle(ocrResult.text, fromRequested, toRequested)) || ocrResult.text;
             resRegions.push({
@@ -118,12 +163,24 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             });
         }
 
-        console.log(`📤 Found ${resRegions.length} regions, returning original image for PixPin to render`);
+        console.log(`📤 Found ${resRegions.length} regions to render`);
 
-        // ✅ Return original image + resRegions — PixPin renders locally
+        // Render the image with text overlays
+        const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
+        
+        let renderImageBase64;
+        if (renderedBuffer) {
+            renderImageBase64 = renderedBuffer.toString('base64');
+            console.log('✅ Image rendered successfully');
+        } else {
+            // Fallback: return original image (Image-to-Text mode)
+            console.warn('⚠️ Rendering failed, returning original image');
+            renderImageBase64 = originalBase64;
+        }
+
         res.json({
             errorCode: 0,
-            render_image: originalBase64,
+            render_image: renderImageBase64,
             resRegions: resRegions
         });
 
