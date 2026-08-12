@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
-import fs from "fs";
+import sharp from "sharp";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -21,14 +21,8 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
 
     try {
-        // ✅ Dynamic import for ya-ocr (ES Module)
         const { OCRClient } = await import('ya-ocr');
-        
-        // ✅ Dynamic import for svg-to-png (ES Module)
-        const { Converter } = await import('svg-to-png');
-        const converter = new Converter();
 
-        // Upload to imgbb with your API key
         const formData = new FormData();
         formData.append('image', req.file.buffer.toString('base64'));
 
@@ -40,17 +34,16 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const imageUrl = uploadResponse.data.data.url;
         console.log(`📤 Image uploaded to: ${imageUrl}`);
 
-        // Run ya-ocr
         const client = new OCRClient({ withTranslate: true });
         const result = await client.scanByUrl(imageUrl);
 
         console.log(`📝 Extracted: ${result.text ? result.text.substring(0, 100) : 'No text'}...`);
         console.log(`📝 Translated: ${result.translatedText ? result.translatedText.substring(0, 100) : 'No translation'}...`);
 
-        // Convert SVG to PNG
-        const pngBuffer = await converter.convert(result.svg);
+        const pngBuffer = await sharp(Buffer.from(result.svg))
+            .png()
+            .toBuffer();
 
-        // Return the rendered image
         const base64Image = pngBuffer.toString('base64');
 
         const resRegions = [{
