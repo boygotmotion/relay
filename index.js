@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
-import { createCanvas, loadImage } from "canvas";
+import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -10,17 +10,27 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 1. IMPROVED LANGUAGE MAPPING
+/**
+ * FONT NOTE: 
+ * Vercel servers have very few fonts. To render Chinese, Japanese, or Arabic,
+ * you should place a .ttf file (like NotoSans-Regular.ttf) in your project folder
+ * and uncomment the line below:
+ * 
+ * GlobalFonts.registerFromPath('./NotoSans-Regular.ttf', 'GlobalFont');
+ */
+
+// Helper: Map standard codes to Google Translate codes
 function toGoogleLang(l) {
-    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es" };
+    const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "id": "id" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
 
+// Helper: Map standard codes to OCR.space codes
 function toOCRLang(l) {
     const dict = { "zh": "chs", "jp": "jpn", "ko": "kor", "fra": "fre", "spa": "spa", "ara": "ara", "de": "ger" };
     let s = String(l).toLowerCase();
-    return dict[s] || "eng"; // Default to eng
+    return dict[s] || "eng";
 }
 
 async function translateWithGoogle(txt, f, t) {
@@ -40,9 +50,9 @@ async function translateWithGoogle(txt, f, t) {
 async function extractTextWithOCR(imageBuffer, fromLang) {
     try {
         const formData = new FormData();
-        formData.append('apikey', 'helloworld'); // Use your real key in production
+        formData.append('apikey', 'helloworld'); // Replace 'helloworld' with your actual OCR.space API key
         formData.append('file', imageBuffer, { filename: 'image.jpg' });
-        formData.append('language', toOCRLang(fromLang)); 
+        formData.append('language', toOCRLang(fromLang));
         formData.append('OCREngine', '2');
         formData.append('isOverlayRequired', 'true');
 
@@ -61,13 +71,12 @@ async function extractTextWithOCR(imageBuffer, fromLang) {
     } catch (e) { return null; }
 }
 
-// 2. UPDATED RENDERING LOGIC (Using Canvas)
 async function renderTextOnImage(imageBuffer, regions) {
     const img = await loadImage(imageBuffer);
     const canvas = createCanvas(img.width, img.height);
     const ctx = canvas.getContext('2d');
 
-    // Draw the original image first
+    // 1. Draw original image
     ctx.drawImage(img, 0, 0);
 
     for (const region of regions) {
@@ -75,38 +84,32 @@ async function renderTextOnImage(imageBuffer, regions) {
         const text = region.tranContent || '';
         if (!text || w <= 0 || h <= 0) continue;
 
-        // 3. SURGICAL BACKGROUND (Pixel Sampling)
-        // We sample a pixel from the top-left edge of the box
+        // 2. SURGICAL BACKGROUND (Pixel Sampling)
+        // Sample color from the top-left edge of the box to cover old text
         const pixelData = ctx.getImageData(Math.max(0, x - 1), Math.max(0, y - 1), 1, 1).data;
         const r = pixelData[0], g = pixelData[1], b = pixelData[2];
         
-        // Fill the background to hide original text
         ctx.fillStyle = `rgb(${r},${g},${b})`;
         ctx.fillRect(x, y, w, h);
 
-        // 4. COLOR SELECTION (Luminance check)
+        // 3. COLOR SELECTION (Luminance check)
         const brightness = (r * 0.299 + g * 0.587 + b * 0.114);
         const textColor = brightness > 125 ? 'black' : 'white';
 
-        // 5. DYNAMIC FONT CALCULATION
-        // We use system fonts that support Unicode (sans-serif)
-        let fontSize = h * 0.8; 
-        ctx.font = `${fontSize}px sans-serif`;
-        
-        // Measure text width
-        let metrics = ctx.measureText(text);
-        let actualWidth = metrics.width;
-
-        // 6. THE SQUEEZE FIX
+        // 4. DYNAMIC FONT CALCULATION
+        // We set font size to roughly 75% of the box height
+        let fontSize = Math.floor(h * 0.75); 
+        ctx.font = `${fontSize}px sans-serif`; // Use 'GlobalFont' if you registered one above
         ctx.fillStyle = textColor;
         ctx.textBaseline = 'middle';
 
-        if (actualWidth > w) {
-            // If text is wider than the box, use the Canvas 'maxWidth' parameter 
-            // which automatically compresses the text horizontally
-            ctx.fillText(text, x, y + (h / 2), w);
+        // 5. THE "SQUEEZE" FIX
+        // Canvas fillText has a 4th parameter: maxWidth. 
+        // If the text is wider than 'w', Canvas will automatically compress the characters.
+        const metrics = ctx.measureText(text);
+        if (metrics.width > w) {
+            ctx.fillText(text, x, y + (h / 2), w); 
         } else {
-            // Draw normally, centered vertically in the box
             ctx.fillText(text, x, y + (h / 2));
         }
     }
@@ -115,11 +118,11 @@ async function renderTextOnImage(imageBuffer, regions) {
 }
 
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
-    if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
+    if (!req.file) return res.json({ errorCode: 1, msg: "No image provided" });
     const { from = "auto", to = "zh" } = req.body;
 
     try {
-        // Step 1: OCR (passing the 'from' language for better accuracy)
+        // Step 1: Perform OCR
         const ocr = await extractTextWithOCR(req.file.buffer, from);
         
         if (!ocr || !ocr.text) {
@@ -130,12 +133,12 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             });
         }
 
-        // Step 2: Translation
+        // Step 2: Translate each detected line
         const resRegions = [];
         for (const line of ocr.lines) {
             const dstText = await translateWithGoogle(line.LineText, from, to) || line.LineText;
             
-            // Reconstruct bounding box from OCR words
+            // Calculate bounding box based on word positions
             const first = line.Words[0];
             const last = line.Words[line.Words.length - 1];
             const boxW = (last.Left + last.Width) - first.Left;
@@ -146,7 +149,7 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             });
         }
 
-        // Step 3: Render (Canvas handles Unicode/All Languages)
+        // Step 3: Render the translated text back onto the image
         const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
         
         res.json({ 
@@ -156,9 +159,13 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         });
 
     } catch (err) { 
-        console.error(err);
-        res.json({ errorCode: 1, msg: err.message }); 
+        console.error("Internal Error:", err);
+        res.status(500).json({ errorCode: 1, msg: err.message }); 
     }
 });
 
-app.listen(3000, () => console.log("Universal Renderer Live on Port 3000"));
+// Port handling for local and production (Vercel)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+export default app;
