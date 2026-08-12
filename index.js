@@ -10,10 +10,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.post("/", (req, res) => {
-    res.send("🚀 PixPin Native Relay is LIVE. Send POST to /api/trans/sdk/picture");
-});
-
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
@@ -57,18 +53,13 @@ async function extractTextWithOCR(imageBuffer) {
             };
         }
         return null;
-    } catch (e) {
-        console.error('OCR Exception:', e.message);
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 let fontCache = {};
-
 async function getFont(size, color) {
     const key = `${size}-${color}`;
     if (fontCache[key]) return fontCache[key];
-    
     const urls = {
         '16-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-black/open-sans-16-black.fnt',
         '16-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-white/open-sans-16-white.fnt',
@@ -77,166 +68,102 @@ async function getFont(size, color) {
         '64-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-black/open-sans-64-black.fnt',
         '64-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-white/open-sans-64-white.fnt',
     };
-    const url = urls[`${size}-${color}`];
-    if (!url) throw new Error(`No font URL for ${size}-${color}`);
-    
+    const url = urls[key];
     try {
         const font = await Jimp.loadFont(url);
         fontCache[key] = font;
         return font;
-    } catch (err) {
-        throw new Error(`Failed to load font ${size}-${color}: ${err.message}`);
-    }
+    } catch (err) { throw err; }
 }
 
 async function renderTextOnImage(imageBuffer, regions) {
-    const errors = [];
-    let image;
-    try {
-        image = await Jimp.read(imageBuffer);
-    } catch (err) {
-        return { renderedBuffer: null, errors: [err.message] };
-    }
+    let image = await Jimp.read(imageBuffer);
 
-    for (let i = 0; i < regions.length; i++) {
-        const region = regions[i];
+    for (const region of regions) {
         const [x, y, w, h] = region.boundingBox.split(',').map(Number);
         if (w <= 0 || h <= 0) continue;
 
         const actualW = Math.min(x + w, image.bitmap.width) - x;
         const actualH = Math.min(y + h, image.bitmap.height) - y;
 
-        try {
-            // Sampling background for the fill
-            let avgR = 0, avgG = 0, avgB = 0;
-            const idx = (Math.floor(y + actualH / 2) * image.bitmap.width + Math.floor(x + actualW / 2)) * 4;
-            avgR = image.bitmap.data[idx];
-            avgG = image.bitmap.data[idx+1];
-            avgB = image.bitmap.data[idx+2];
+        // Sample background
+        const idx = (Math.floor(y + actualH / 2) * image.bitmap.width + Math.floor(x + actualW / 2)) * 4;
+        const avgR = image.bitmap.data[idx], avgG = image.bitmap.data[idx+1], avgB = image.bitmap.data[idx+2];
 
-            // Clean background fill
-            image.scan(x, y, actualW, actualH, function(px, py, idx) {
-                this.bitmap.data[idx + 0] = avgR;
-                this.bitmap.data[idx + 1] = avgG;
-                this.bitmap.data[idx + 2] = avgB;
-                this.bitmap.data[idx + 3] = 255;
-            });
+        const text = region.tranContent || '';
+        if (!text) continue;
 
-            let text = region.tranContent || '';
-            if (!text) continue;
+        // --- NEW FITTING LOGIC ---
+        // 1. Determine starting size based on height
+        let size = 16;
+        if (actualH > 60) size = 64;
+        else if (actualH > 30) size = 32;
 
-            // --- FONT SELECTION & CLUSTERING FIX ---
-            let size = 16;
-            if (actualH > 70) size = 64;
-            else if (actualH > 35) size = 32;
-
-            const charWidth = size * 0.52;
-            const lineHeight = size * 1.25;
-            const maxLines = Math.floor(actualH / lineHeight) || 1;
-
-            let lines = [];
-            
-            // If height only allows 1 line, DO NOT WRAP (Prevents Clustering/Overlap)
-            if (maxLines === 1) {
-                const maxChars = Math.floor((actualW - 10) / charWidth);
-                if (text.length > maxChars) {
-                    text = text.substring(0, Math.max(0, maxChars - 3)) + "...";
-                }
-                lines = [text];
-            } else {
-                // Multi-line word wrap logic
-                const words = text.split(' ');
-                let currentLine = '';
-                for (const word of words) {
-                    const testLine = currentLine ? currentLine + ' ' + word : word;
-                    if (testLine.length * charWidth < actualW - 10) {
-                        currentLine = testLine;
-                    } else {
-                        lines.push(currentLine);
-                        currentLine = word;
-                    }
-                }
-                if (currentLine) lines.push(currentLine);
-                
-                // Truncate vertically if too many lines
-                if (lines.length > maxLines) {
-                    lines = lines.slice(0, maxLines);
-                    lines[lines.length - 1] += "...";
-                }
-            }
-
-            const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
-            const color = brightness > 128 ? 'black' : 'white';
-            const font = await getFont(size, color);
-
-            const totalTextHeight = lines.length * lineHeight;
-            const startY = y + (actualH - totalTextHeight) / 2;
-
-            for (let li = 0; li < lines.length; li++) {
-                const line = lines[li];
-                const lineWidth = line.length * charWidth;
-                const startX = x + (actualW - lineWidth) / 2;
-                image.print(font, startX, startY + (li * lineHeight), line);
-            }
-
-        } catch (err) {
-            errors.push(`Error in region ${i}: ${err.message}`);
+        // 2. Shrink font size if the text is too wide for the box
+        let charWidth = size * 0.55;
+        while (size > 16 && (text.length * charWidth > actualW)) {
+            if (size === 64) size = 32;
+            else if (size === 32) size = 16;
+            charWidth = size * 0.55;
         }
+
+        // 3. Expand the background box slightly if French is longer (fixes the "gray box" clipping)
+        const textWidth = text.length * charWidth;
+        const fillWidth = Math.max(actualW, Math.min(textWidth + 10, image.bitmap.width - x));
+
+        image.scan(x, y, fillWidth, actualH, function(px, py, idx) {
+            this.bitmap.data[idx + 0] = avgR;
+            this.bitmap.data[idx + 1] = avgG;
+            this.bitmap.data[idx + 2] = avgB;
+            this.bitmap.data[idx + 3] = 255;
+        });
+
+        // 4. No more aggressive "maxChars" truncation. 
+        // We only use ellipsis if it's physically impossible to fit on one line at the smallest font.
+        let finalDisplayToken = text;
+        const absoluteMaxChars = Math.floor((image.bitmap.width - x) / charWidth);
+        if (text.length > absoluteMaxChars) {
+            finalDisplayToken = text.substring(0, absoluteMaxChars - 3) + "...";
+        }
+
+        const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
+        const color = brightness > 128 ? 'black' : 'white';
+        const font = await getFont(size, color);
+
+        // Center vertically in the original box
+        const startY = y + (actualH - (size * 1.2)) / 2;
+        image.print(font, x + 5, startY, finalDisplayToken);
     }
 
     const renderedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
-    return { renderedBuffer, errors };
+    return { renderedBuffer };
 }
 
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
-    const fromRequested = req.query.from || req.body.from || "auto";
-    const toRequested = req.query.to || req.body.to || "zh";
-
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
+    const from = req.body.from || "auto";
+    const to = req.body.to || "zh";
 
     try {
-        const ocrResult = await extractTextWithOCR(req.file.buffer);
-        if (!ocrResult || !ocrResult.text) {
+        const ocr = await extractTextWithOCR(req.file.buffer);
+        if (!ocr || !ocr.text) {
             return res.json({ errorCode: 0, render_image: req.file.buffer.toString('base64'), resRegions: [] });
         }
 
         const resRegions = [];
-        for (const line of ocrResult.lines) {
-            const srcText = line.LineText.trim();
-            if (!srcText) continue;
-
-            const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
-            
-            if (line.Words && line.Words.length > 0) {
-                const firstWord = line.Words[0];
-                const lastWord = line.Words[line.Words.length - 1];
-                const x = firstWord.Left;
-                const y = firstWord.Top;
-                const w = (lastWord.Left + lastWord.Width) - firstWord.Left;
-                const h = Math.max(...line.Words.map(w => w.Height));
-
-                resRegions.push({
-                    context: srcText,
-                    tranContent: dstText,
-                    boundingBox: `${Math.round(x)},${Math.round(y)},${Math.round(w)},${Math.round(h)}`
-                });
-            }
+        for (const line of ocr.lines) {
+            const dstText = (await translateWithGoogle(line.LineText, from, to)) || line.LineText;
+            const first = line.Words[0], last = line.Words[line.Words.length - 1];
+            resRegions.push({
+                tranContent: dstText,
+                boundingBox: `${Math.round(first.Left)},${Math.round(first.Top)},${Math.round((last.Left + last.Width) - first.Left)},${Math.round(line.MaxHeight || 30)}`
+            });
         }
 
         const { renderedBuffer } = await renderTextOnImage(req.file.buffer, resRegions);
-        
-        res.json({
-            errorCode: 0,
-            render_image: renderedBuffer.toString('base64'),
-            resRegions: resRegions
-        });
-
-    } catch (err) {
-        res.json({ errorCode: 1, msg: err.message });
-    }
+        res.json({ errorCode: 0, render_image: renderedBuffer.toString('base64'), resRegions });
+    } catch (err) { res.json({ errorCode: 1, msg: err.message }); }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Relay running on port ${PORT}`));
-
+app.listen(3000, () => console.log("Relay Live"));
 export default app;
