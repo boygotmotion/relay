@@ -10,14 +10,12 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Language helper
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
 
-// Translation logic
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
@@ -32,7 +30,6 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return null; }
 }
 
-// OCR logic
 async function extractTextWithOCR(imageBuffer) {
     try {
         const formData = new FormData();
@@ -57,7 +54,6 @@ async function extractTextWithOCR(imageBuffer) {
     } catch (e) { return null; }
 }
 
-// Font cache
 let fontCache = {};
 async function getFont(size, color) {
     const key = `${size}-${color}`;
@@ -77,53 +73,55 @@ async function renderTextOnImage(imageBuffer, regions) {
         const text = region.tranContent || '';
         if (!text || w <= 0 || h <= 0) continue;
 
-        // 1. DYNAMIC FONT REDUCTION
-        // Calculate how much space is left before the right edge of the image
-        const availableWidth = imgW - x - 10; 
+        // 1. CALCULATE AVAILABLE SPACE
+        const availableWidth = imgW - x - 15; // padding
         
-        let size = 32; // Default starting size
-        if (h < 25) size = 16;
+        // 2. CHOOSE BEST NATIVE FONT SIZE
+        let size = 16;
         if (h > 60) size = 64;
+        else if (h > 30) size = 32;
 
-        // Reduce size if it exceeds the image border
-        let estimatedWidth = text.length * (size * 0.55);
-        while (size > 16 && estimatedWidth > availableWidth) {
-            size = (size === 64) ? 32 : 16;
-            estimatedWidth = text.length * (size * 0.55);
+        const charWidth = size * 0.52;
+        let estimatedWidth = text.length * charWidth;
+
+        // Downscale to 16px if 32px is too wide
+        if (size > 16 && estimatedWidth > availableWidth) {
+            size = 16;
+            estimatedWidth = text.length * (16 * 0.52);
         }
 
-        // 2. TRANSPARENT-LOOKING BACKGROUND
-        // Sample color from just outside the top-left of the original text
-        const sampleX = Math.max(0, x - 2);
-        const sampleY = Math.max(0, y - 2);
-        const bgColor = image.getPixelColor(sampleX, sampleY);
-        
-        // Convert to RGB for brightness check
-        const rgba = Jimp.intToRGBA(bgColor);
+        // 3. SURGICAL BACKGROUND (Sample from UI)
+        const bgColorInt = image.getPixelColor(Math.max(0, x - 2), Math.max(0, y - 2));
+        const rgba = Jimp.intToRGBA(bgColorInt);
         const brightness = (rgba.r * 0.299 + rgba.g * 0.587 + rgba.b * 0.114);
         const textColor = brightness > 125 ? 'black' : 'white';
 
-        // 3. SURGICAL FILL (Only fill the width of the actual text)
-        const textWidth = Math.min(estimatedWidth + 10, availableWidth);
-        image.scan(x, y, textWidth, h, function(px, py, idx) {
+        // Clear the old text
+        image.scan(x, y, Math.min(estimatedWidth + 5, imgW - x), h, function(px, py, idx) {
             this.bitmap.data[idx + 0] = rgba.r;
             this.bitmap.data[idx + 1] = rgba.g;
             this.bitmap.data[idx + 2] = rgba.b;
-            this.bitmap.data[idx + 3] = 255; // Solid to cover old text
+            this.bitmap.data[idx + 3] = 255;
         });
 
-        // 4. FINAL RENDER
+        // 4. THE "SQUEEZE" FIX (Dynamic Font Scaling)
         const font = await getFont(size, textColor);
-        const verticalCenter = y + (h - (size * 1.1)) / 2;
+        const textHeight = size * 1.2;
         
-        // Final sanity check for truncation (only if even 16px hits the screen edge)
-        let finalStr = text;
-        if (text.length * (size * 0.52) > availableWidth) {
-            const maxChars = Math.floor(availableWidth / (size * 0.52));
-            finalStr = text.substring(0, maxChars - 3) + "...";
+        if (estimatedWidth > availableWidth) {
+            // Text is too long even at 16px. We print to a temp layer and shrink it.
+            let tempTextLayer = new Jimp(estimatedWidth, textHeight, 0x00000000);
+            tempTextLayer.print(font, 0, 0, text);
+            
+            // Resize text horizontally to fit the available space
+            tempTextLayer.resize(availableWidth, textHeight); 
+            
+            // Composite the shrunk text onto the main image
+            image.composite(tempTextLayer, x + 2, y + (h - textHeight) / 2);
+        } else {
+            // Normal print
+            image.print(font, x + 2, y + (h - textHeight) / 2, text);
         }
-
-        image.print(font, x + 2, verticalCenter, finalStr);
     }
 
     const renderedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
@@ -157,5 +155,5 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     } catch (err) { res.json({ errorCode: 1, msg: err.message }); }
 });
 
-app.listen(3000, () => console.log("Relay running"));
+app.listen(3000, () => console.log("Relay Live - Full Fit Enabled"));
 export default app;
