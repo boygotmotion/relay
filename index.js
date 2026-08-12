@@ -14,7 +14,6 @@ app.post("/", (req, res) => {
     res.send("🚀 PixPin Native Relay is LIVE. Send POST to /api/trans/sdk/picture");
 });
 
-// --- UTILS ---
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
@@ -35,14 +34,13 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return null; }
 }
 
-// --- OCR with OCR.space (Free, no registration) ---
 async function extractTextWithOCR(imageBuffer) {
     try {
         const formData = new FormData();
-        formData.append('apikey', 'helloworld'); // Free OCR.space API key
+        formData.append('apikey', 'helloworld');
         formData.append('file', imageBuffer, { filename: 'image.jpg' });
         formData.append('language', 'eng');
-        formData.append('OCREngine', '2'); // Engine 2 is more accurate
+        formData.append('OCREngine', '2');
 
         const response = await axios.post('https://api.ocr.space/parse/image', formData, {
             headers: formData.getHeaders(),
@@ -50,11 +48,7 @@ async function extractTextWithOCR(imageBuffer) {
         });
 
         if (response.data && response.data.OCRExitCode === 1) {
-            const parsedText = response.data.ParsedResults[0].ParsedText;
-            return parsedText.trim();
-        } else if (response.data && response.data.ErrorMessage) {
-            console.error('OCR Error:', response.data.ErrorMessage);
-            return null;
+            return response.data.ParsedResults[0].ParsedText.trim();
         }
         return null;
     } catch (e) {
@@ -63,7 +57,6 @@ async function extractTextWithOCR(imageBuffer) {
     }
 }
 
-// --- MAIN ENDPOINT (Image-to-Image) ---
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     const fromRequested = req.query.from || req.body.from || "auto";
     const toRequested = req.query.to || req.body.to || "zh";
@@ -75,7 +68,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         const width = image.bitmap.width;
         const height = image.bitmap.height;
 
-        // Step 1: OCR - Extract text from image
         console.log('🔍 Running OCR...');
         const extractedText = await extractTextWithOCR(req.file.buffer);
         
@@ -88,20 +80,18 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             });
         }
         
-        console.log(`📝 Extracted text: ${extractedText.substring(0, 100)}...`);
+        console.log(`📝 Extracted: ${extractedText.substring(0, 100)}...`);
 
-        // Step 2: Translate the extracted text
         const dstText = (await translateWithGoogle(extractedText, fromRequested, toRequested)) || extractedText;
-        console.log(`📝 Translated text: ${dstText.substring(0, 100)}...`);
+        console.log(`📝 Translated: ${dstText.substring(0, 100)}...`);
 
-        // Step 3: Render translated text on the image
         const padding = 20;
         const x = padding;
         const y = padding;
         const maxWidth = width - (padding * 2);
         const textBgHeight = Math.min(120, height - (padding * 2));
 
-        // Paint white background box for readability
+        // Paint white background
         image.scan(x, y, maxWidth, textBgHeight, function(px, py, idx) {
             this.bitmap.data[idx + 0] = 255;
             this.bitmap.data[idx + 1] = 255;
@@ -109,12 +99,33 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             this.bitmap.data[idx + 3] = 200;
         });
 
-        // Draw translated text
+        // ✅ FIX: Use Jimp's built-in font (FONT_SANS_32_BLACK is available)
         const font = await Jimp.loadFont(Jimp.FONT_SANS_32_BLACK);
-        const wrappedText = Jimp.wrapText(font, dstText, maxWidth - 20);
-        image.print(font, x + 10, y + 10, wrappedText, maxWidth - 20, textBgHeight - 20);
+        
+        // Split text into lines manually if wrapText fails
+        const maxCharsPerLine = Math.floor((maxWidth - 20) / 16);
+        const lines = [];
+        let currentLine = '';
+        const words = dstText.split(' ');
+        for (const word of words) {
+            if ((currentLine + ' ' + word).length <= maxCharsPerLine) {
+                currentLine += (currentLine ? ' ' : '') + word;
+            } else {
+                if (currentLine) lines.push(currentLine);
+                currentLine = word;
+            }
+        }
+        if (currentLine) lines.push(currentLine);
 
-        // Step 4: Return rendered image
+        // Draw each line
+        const lineHeight = 36;
+        let currentY = y + 10;
+        for (const line of lines) {
+            if (currentY + lineHeight > y + textBgHeight - 10) break;
+            image.print(font, x + 10, currentY, line, maxWidth - 20, lineHeight);
+            currentY += lineHeight;
+        }
+
         const imageBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
         const base64Image = imageBuffer.toString("base64");
 
@@ -123,8 +134,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             tranContent: dstText.substring(0, 200),
             boundingBox: `${x},${y},${maxWidth},${textBgHeight}`
         }];
-
-        console.log(`📤 Sending response with rendered image`);
 
         res.json({
             errorCode: 0,
