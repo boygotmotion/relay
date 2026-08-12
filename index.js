@@ -1,8 +1,8 @@
-const express = require("express");
-const axios = require("axios");
-const multer = require("multer");
-const FormData = require("form-data");
-const fs = require("fs");
+import express from "express";
+import axios from "axios";
+import multer from "multer";
+import FormData from "form-data";
+import fs from "fs";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -74,4 +74,4 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
 app.get("/", (req, res) => res.send("🚀 PixPin Native Relay is LIVE"));
 
-module.exports = app;
+export default app;
