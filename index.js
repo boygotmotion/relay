@@ -2,7 +2,9 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
-import Jimp from "jimp";
+import { createCanvas, loadImage, registerFont } from "canvas";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -14,12 +16,75 @@ app.post("/", (req, res) => {
     res.send("🚀 PixPin Native Relay is LIVE. Send POST to /api/trans/sdk/picture");
 });
 
+// =============================================
+// 1. FONT MANAGEMENT (download from GitHub on startup)
+// =============================================
+const FONT_SOURCES = {
+    'zh': { family: 'NotoSansSC', url: 'https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/Subset/OTF/SimplifiedChinese/NotoSansSC-Regular.otf' },
+    'ja': { family: 'NotoSansJP', url: 'https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/Subset/OTF/Japanese/NotoSansJP-Regular.otf' },
+    'ko': { family: 'NotoSansKR', url: 'https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/Subset/OTF/Korean/NotoSansKR-Regular.otf' },
+    'ar': { family: 'NotoNaskhArabic', url: 'https://raw.githubusercontent.com/google/fonts/main/ofl/notonaskharabic/NotoNaskhArabic%5Bwght%5D.ttf' },
+    'th': { family: 'NotoSansThai', url: 'https://raw.githubusercontent.com/google/fonts/main/ofl/notosansthai/NotoSansThai%5Bwght%5D.ttf' },
+};
+
+const fontCache = new Map();
+
+async function downloadAndRegisterFont(lang) {
+    const source = FONT_SOURCES[lang];
+    if (!source) return null;
+    if (fontCache.has(source.family)) return source.family;
+
+    try {
+        const response = await axios.get(source.url, { responseType: 'arraybuffer' });
+        const fontData = Buffer.from(response.data);
+        const tmpPath = path.join('/tmp', `${source.family}.otf`);
+        fs.writeFileSync(tmpPath, fontData);
+        registerFont(tmpPath, { family: source.family });
+        fontCache.set(source.family, tmpPath);
+        console.log(`✅ Font registered: ${source.family}`);
+        return source.family;
+    } catch (err) {
+        console.error(`❌ Failed to download/register ${source.family}: ${err.message}`);
+        return null;
+    }
+}
+
+// Pre‑download all fonts at startup (cold start will take a bit longer)
+(async () => {
+    const langs = Object.keys(FONT_SOURCES);
+    await Promise.all(langs.map(downloadAndRegisterFont));
+    console.log('🎯 All fonts ready');
+})();
+
+function getFontFamily(lang) {
+    const map = {
+        'zh': 'NotoSansSC',
+        'ja': 'NotoSansJP',
+        'ko': 'NotoSansKR',
+        'ar': 'NotoNaskhArabic',
+        'th': 'NotoSansThai',
+        'fr': 'Arial',
+        'es': 'Arial',
+        'de': 'Arial',
+        'it': 'Arial',
+        'id': 'Arial',
+        'en': 'Arial'
+    };
+    return map[lang] || 'Arial';
+}
+
+// =============================================
+// 2. LANGUAGE UTILITIES
+// =============================================
 function toGoogleLang(l) {
     const dict = { "jp": "ja", "zh": "zh-CN", "ara": "ar", "kor": "ko", "fra": "fr", "spa": "es", "de": "de", "th": "th", "it": "it", "id": "id" };
     let s = String(l).toLowerCase();
     return dict[s] || s;
 }
 
+// =============================================
+// 3. GOOGLE TRANSLATE (free, no API key)
+// =============================================
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
@@ -34,6 +99,9 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return null; }
 }
 
+// =============================================
+// 4. OCR.SPACE (free, no registration)
+// =============================================
 async function extractTextWithOCR(imageBuffer) {
     try {
         const formData = new FormData();
@@ -63,85 +131,56 @@ async function extractTextWithOCR(imageBuffer) {
     }
 }
 
-// ----- Font cache (loaded from GitHub raw URLs) -----
-let fontCache = {};
-
-async function getFont(size, color) {
-    const key = `${size}-${color}`;
-    if (fontCache[key]) return fontCache[key];
-    
-    const urls = {
-        '16-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-black/open-sans-16-black.fnt',
-        '16-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-white/open-sans-16-white.fnt',
-        '32-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-32-black/open-sans-32-black.fnt',
-        '32-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-32-white/open-sans-32-white.fnt',
-        '64-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-black/open-sans-64-black.fnt',
-        '64-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-white/open-sans-64-white.fnt',
-    };
-    const url = urls[`${size}-${color}`];
-    if (!url) throw new Error(`No font URL for ${size}-${color}`);
-    
-    try {
-        const font = await Jimp.loadFont(url);
-        fontCache[key] = font;
-        console.log(`✅ Loaded font: ${size}-${color} from URL`);
-        return font;
-    } catch (err) {
-        throw new Error(`Failed to load font ${size}-${color}: ${err.message}`);
-    }
-}
-
-async function renderTextOnImage(imageBuffer, regions) {
+// =============================================
+// 5. IMAGE RENDERING (canvas with proper font)
+// =============================================
+async function renderTextOnImage(imageBuffer, regions, targetLang) {
     const errors = [];
-    let image;
     try {
-        image = await Jimp.read(imageBuffer);
-        console.log(`📐 Image dimensions: ${image.bitmap.width}x${image.bitmap.height}`);
-    } catch (err) {
-        errors.push(`Jimp.read failed: ${err.message}`);
-        console.error(errors[0]);
-        return { renderedBuffer: null, errors };
-    }
+        const img = await loadImage(imageBuffer);
+        const width = img.width;
+        const height = img.height;
 
-    for (let i = 0; i < regions.length; i++) {
-        const region = regions[i];
-        const [x, y, w, h] = region.boundingBox.split(',').map(Number);
-        console.log(`📦 Region ${i}: x=${x}, y=${y}, w=${w}, h=${h}`);
+        const canvas = createCanvas(width, height);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
 
-        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x >= image.bitmap.width || y >= image.bitmap.height) {
-            errors.push(`Invalid region ${i}: ${region.boundingBox}`);
-            console.warn(`⚠️ ${errors[errors.length-1]}`);
-            continue;
-        }
+        // Get image data for sampling background
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const data = imageData.data;
+        const getPixel = (px, py) => {
+            if (px < 0 || py < 0 || px >= width || py >= height) return null;
+            const idx = (py * width + px) * 4;
+            return [data[idx], data[idx+1], data[idx+2]];
+        };
 
-        const endX = Math.min(x + w, image.bitmap.width);
-        const endY = Math.min(y + h, image.bitmap.height);
-        const actualW = endX - x;
-        const actualH = endY - y;
+        const fontFamily = getFontFamily(targetLang);
 
-        try {
-            // Sample background color from the border
+        for (const region of regions) {
+            const [x, y, w, h] = region.boundingBox.split(',').map(Number);
+            if (w <= 0 || h <= 0 || x < 0 || y < 0 || x >= width || y >= height) {
+                errors.push(`Invalid region: ${region.boundingBox}`);
+                console.warn(`⚠️ ${errors[errors.length-1]}`);
+                continue;
+            }
+
+            // Sample background color from 1‑px border
             const sampleColors = [];
-            for (let px = Math.max(0, x - 1); px < Math.min(endX + 1, image.bitmap.width); px++) {
-                for (const py of [Math.max(0, y - 1), Math.min(endY, image.bitmap.height - 1)]) {
-                    const idx = (py * image.bitmap.width + px) * 4;
-                    sampleColors.push([
-                        image.bitmap.data[idx],
-                        image.bitmap.data[idx + 1],
-                        image.bitmap.data[idx + 2]
-                    ]);
+            // top & bottom edges
+            for (let px = Math.max(0, x-1); px < Math.min(x+w+1, width); px++) {
+                for (const py of [Math.max(0, y-1), Math.min(y+h, height-1)]) {
+                    const c = getPixel(px, py);
+                    if (c) sampleColors.push(c);
                 }
             }
-            for (let py = Math.max(0, y - 1); py < Math.min(endY + 1, image.bitmap.height); py++) {
-                for (const px of [Math.max(0, x - 1), Math.min(endX, image.bitmap.width - 1)]) {
-                    const idx = (py * image.bitmap.width + px) * 4;
-                    sampleColors.push([
-                        image.bitmap.data[idx],
-                        image.bitmap.data[idx + 1],
-                        image.bitmap.data[idx + 2]
-                    ]);
+            // left & right edges
+            for (let py = Math.max(0, y-1); py < Math.min(y+h+1, height); py++) {
+                for (const px of [Math.max(0, x-1), Math.min(x+w, width-1)]) {
+                    const c = getPixel(px, py);
+                    if (c) sampleColors.push(c);
                 }
             }
+
             let avgR = 0, avgG = 0, avgB = 0;
             for (const c of sampleColors) {
                 avgR += c[0]; avgG += c[1]; avgB += c[2];
@@ -154,52 +193,37 @@ async function renderTextOnImage(imageBuffer, regions) {
                 avgR = 255; avgG = 255; avgB = 255;
             }
 
-            // Fill the region with sampled background (semi‑transparent)
-            image.scan(x, y, actualW, actualH, function(px, py, idx) {
-                this.bitmap.data[idx + 0] = avgR;
-                this.bitmap.data[idx + 1] = avgG;
-                this.bitmap.data[idx + 2] = avgB;
-                this.bitmap.data[idx + 3] = 200;
-            });
+            // Fill region with background color (opaque)
+            ctx.fillStyle = `rgb(${avgR},${avgG},${avgB})`;
+            ctx.fillRect(x, y, w, h);
 
-            // Prepare translated text
+            // Translated text
             const text = region.tranContent || '';
             if (!text) continue;
 
-            // Determine font size (16, 32, or 64) based on region size
-            let size = 16;
-            if (actualH > 32 && actualW > 64) size = 32;
-            if (actualH > 64 && actualW > 128) size = 64;
-            // Ensure text fits width
-            const avgCharWidth = size * 0.55;
-            if (text.length * avgCharWidth > actualW - 10) {
-                if (size === 64) size = 32;
-                else if (size === 32) size = 16;
+            // Determine font size
+            let fontSize = Math.min(h * 0.8, 64);
+            const maxWidth = w - 10;
+            const maxHeight = h - 10;
+
+            // Measure text and shrink if needed
+            const measureCtx = canvas.getContext('2d');
+            measureCtx.font = `bold ${fontSize}px '${fontFamily}'`;
+            let textWidth = measureCtx.measureText(text).width;
+            while (textWidth > maxWidth && fontSize > 10) {
+                fontSize -= 2;
+                measureCtx.font = `bold ${fontSize}px '${fontFamily}'`;
+                textWidth = measureCtx.measureText(text).width;
             }
 
-            // Choose text color based on background brightness
-            const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
-            const color = brightness > 128 ? 'black' : 'white';
-
-            // Load font (cached)
-            let font;
-            try {
-                font = await getFont(size, color);
-            } catch (err) {
-                errors.push(`Font load error: ${err.message}`);
-                console.error(errors[errors.length - 1]);
-                continue;
-            }
-
-            // Word wrap
-            const maxWidth = actualW - 10;
-            const lines = [];
-            let currentLine = '';
+            // Simple word wrap if multiple lines needed
             const words = text.split(' ');
-            const charWidth = size * 0.55;
+            let lines = [];
+            let currentLine = '';
             for (const word of words) {
                 const testLine = currentLine ? currentLine + ' ' + word : word;
-                if (testLine.length * charWidth < maxWidth) {
+                const testWidth = measureCtx.measureText(testLine).width;
+                if (testWidth < maxWidth) {
                     currentLine = testLine;
                 } else {
                     if (currentLine) lines.push(currentLine);
@@ -208,37 +232,55 @@ async function renderTextOnImage(imageBuffer, regions) {
             }
             if (currentLine) lines.push(currentLine);
 
-            const lineHeight = size * 1.2;
-            const totalHeight = lines.length * lineHeight;
-            let startY = y + (actualH - totalHeight) / 2;
-            if (startY < y) startY = y + 2;
-
-            // Draw each line centered
-            for (let li = 0; li < lines.length; li++) {
-                const line = lines[li];
-                const lineWidth = line.length * charWidth;
-                const startX = x + (actualW - lineWidth) / 2;
-                const lineY = startY + li * lineHeight;
-                image.print(font, startX, lineY, line);
+            const lineHeight = fontSize * 1.4;
+            const totalTextHeight = lines.length * lineHeight;
+            if (totalTextHeight > maxHeight) {
+                // Shrink font further to fit height
+                fontSize = Math.floor(fontSize * (maxHeight / totalTextHeight));
+                if (fontSize < 8) fontSize = 8;
+                // Re‑wrap with new size
+                measureCtx.font = `bold ${fontSize}px '${fontFamily}'`;
+                lines = [];
+                currentLine = '';
+                for (const word of words) {
+                    const testLine = currentLine ? currentLine + ' ' + word : word;
+                    const testWidth = measureCtx.measureText(testLine).width;
+                    if (testWidth < maxWidth) {
+                        currentLine = testLine;
+                    } else {
+                        if (currentLine) lines.push(currentLine);
+                        currentLine = word;
+                    }
+                }
+                if (currentLine) lines.push(currentLine);
             }
-        } catch (err) {
-            errors.push(`Render error on region ${i}: ${err.message}`);
-            console.error(errors[errors.length - 1]);
+
+            // Choose text color (black on light bg, white on dark)
+            const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
+            ctx.fillStyle = brightness > 128 ? '#000000' : '#FFFFFF';
+            ctx.font = `bold ${fontSize}px '${fontFamily}'`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+
+            const startY = y + (h - lines.length * lineHeight) / 2 + lineHeight / 2;
+            for (let i = 0; i < lines.length; i++) {
+                ctx.fillText(lines[i], x + w / 2, startY + i * lineHeight);
+            }
         }
-    }
 
-    let renderedBuffer = null;
-    try {
-        renderedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
-        console.log(`✅ Rendered image size: ${renderedBuffer.length} bytes`);
+        const buffer = canvas.toBuffer('image/jpeg', { quality: 0.9 });
+        console.log(`✅ Rendered image size: ${buffer.length} bytes`);
+        return { renderedBuffer: buffer, errors };
     } catch (err) {
-        errors.push(`getBufferAsync failed: ${err.message}`);
-        console.error(errors[errors.length - 1]);
+        errors.push(`Render error: ${err.message}`);
+        console.error(errors[0]);
+        return { renderedBuffer: null, errors };
     }
-
-    return { renderedBuffer, errors };
 }
 
+// =============================================
+// 6. MAIN ENDPOINT
+// =============================================
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     const fromRequested = req.query.from || req.body.from || "auto";
     const toRequested = req.query.to || req.body.to || "zh";
@@ -250,7 +292,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
         console.log('🔍 Running OCR...');
         const ocrResult = await extractTextWithOCR(req.file.buffer);
-        
         if (!ocrResult || !ocrResult.text) {
             return res.json({
                 errorCode: 1,
@@ -260,16 +301,15 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
                 debug: "OCR returned no text"
             });
         }
-
         console.log(`📝 Extracted: ${ocrResult.text.substring(0, 100)}...`);
 
+        // Build resRegions with translated text
         const resRegions = [];
         for (const line of ocrResult.lines) {
             const srcText = line.LineText.trim();
             if (!srcText) continue;
 
             const dstText = (await translateWithGoogle(srcText, fromRequested, toRequested)) || srcText;
-            
             if (line.Words && line.Words.length > 0) {
                 const firstWord = line.Words[0];
                 const lastWord = line.Words[line.Words.length - 1];
@@ -277,7 +317,6 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
                 const y = Math.round(firstWord.Top);
                 const w = Math.round(lastWord.Left + lastWord.Width - firstWord.Left);
                 const h = Math.round(Math.max(...line.Words.map(w => w.Top + w.Height)) - y);
-
                 resRegions.push({
                     context: srcText,
                     tranContent: dstText,
@@ -297,8 +336,11 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
 
         console.log(`📤 Found ${resRegions.length} regions to render`);
 
-        const { renderedBuffer, errors } = await renderTextOnImage(req.file.buffer, resRegions);
-        
+        // Ensure the target language's font is downloaded (lazy load if not already)
+        await downloadAndRegisterFont(toRequested);
+
+        const { renderedBuffer, errors } = await renderTextOnImage(req.file.buffer, resRegions, toRequested);
+
         let renderImageBase64;
         let debugMsg = null;
         if (renderedBuffer) {
