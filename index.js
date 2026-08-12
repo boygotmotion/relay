@@ -63,6 +63,34 @@ async function extractTextWithOCR(imageBuffer) {
     }
 }
 
+// ----- Font cache (loaded from GitHub raw URLs) -----
+let fontCache = {};
+
+async function getFont(size, color) {
+    const key = `${size}-${color}`;
+    if (fontCache[key]) return fontCache[key];
+    
+    const urls = {
+        '16-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-black/open-sans-16-black.fnt',
+        '16-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-white/open-sans-16-white.fnt',
+        '32-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-32-black/open-sans-32-black.fnt',
+        '32-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-32-white/open-sans-32-white.fnt',
+        '64-black': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-black/open-sans-64-black.fnt',
+        '64-white': 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-64-white/open-sans-64-white.fnt',
+    };
+    const url = urls[`${size}-${color}`];
+    if (!url) throw new Error(`No font URL for ${size}-${color}`);
+    
+    try {
+        const font = await Jimp.loadFont(url);
+        fontCache[key] = font;
+        console.log(`✅ Loaded font: ${size}-${color} from URL`);
+        return font;
+    } catch (err) {
+        throw new Error(`Failed to load font ${size}-${color}: ${err.message}`);
+    }
+}
+
 async function renderTextOnImage(imageBuffer, regions) {
     const errors = [];
     let image;
@@ -71,19 +99,6 @@ async function renderTextOnImage(imageBuffer, regions) {
         console.log(`📐 Image dimensions: ${image.bitmap.width}x${image.bitmap.height}`);
     } catch (err) {
         errors.push(`Jimp.read failed: ${err.message}`);
-        console.error(errors[0]);
-        return { renderedBuffer: null, errors };
-    }
-
-    // Load fonts (black and white variants for different sizes)
-    let fonts = {};
-    try {
-        fonts[16] = { black: await Jimp.loadFont(Jimp.FONT_SANS_16_BLACK), white: await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE) };
-        fonts[32] = { black: await Jimp.loadFont(Jimp.FONT_SANS_32_BLACK), white: await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE) };
-        fonts[64] = { black: await Jimp.loadFont(Jimp.FONT_SANS_64_BLACK), white: await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE) };
-        console.log('✅ Fonts loaded');
-    } catch (err) {
-        errors.push(`Font load failed: ${err.message}`);
         console.error(errors[0]);
         return { renderedBuffer: null, errors };
     }
@@ -105,9 +120,8 @@ async function renderTextOnImage(imageBuffer, regions) {
         const actualH = endY - y;
 
         try {
-            // Sample background color from the 1‑pixel border
+            // Sample background color from the border
             const sampleColors = [];
-            // Top and bottom edges
             for (let px = Math.max(0, x - 1); px < Math.min(endX + 1, image.bitmap.width); px++) {
                 for (const py of [Math.max(0, y - 1), Math.min(endY, image.bitmap.height - 1)]) {
                     const idx = (py * image.bitmap.width + px) * 4;
@@ -118,7 +132,6 @@ async function renderTextOnImage(imageBuffer, regions) {
                     ]);
                 }
             }
-            // Left and right edges
             for (let py = Math.max(0, y - 1); py < Math.min(endY + 1, image.bitmap.height); py++) {
                 for (const px of [Math.max(0, x - 1), Math.min(endX, image.bitmap.width - 1)]) {
                     const idx = (py * image.bitmap.width + px) * 4;
@@ -141,36 +154,44 @@ async function renderTextOnImage(imageBuffer, regions) {
                 avgR = 255; avgG = 255; avgB = 255;
             }
 
-            // Fill the region with the sampled background (semi‑transparent to blend)
+            // Fill the region with sampled background (semi‑transparent)
             image.scan(x, y, actualW, actualH, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = avgR;
                 this.bitmap.data[idx + 1] = avgG;
                 this.bitmap.data[idx + 2] = avgB;
-                this.bitmap.data[idx + 3] = 200; // ~78% opacity
+                this.bitmap.data[idx + 3] = 200;
             });
 
             // Prepare translated text
             const text = region.tranContent || '';
             if (!text) continue;
 
-            // Determine font size based on region height (choose largest that fits)
+            // Determine font size (16, 32, or 64) based on region size
             let size = 16;
             if (actualH > 32 && actualW > 64) size = 32;
             if (actualH > 64 && actualW > 128) size = 64;
-            // But we also want to fit width; we'll do a rough check
+            // Ensure text fits width
             const avgCharWidth = size * 0.55;
             if (text.length * avgCharWidth > actualW - 10) {
-                // Reduce size
                 if (size === 64) size = 32;
                 else if (size === 32) size = 16;
             }
 
             // Choose text color based on background brightness
             const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
-            const colorKey = brightness > 128 ? 'black' : 'white';
-            const font = fonts[size] ? fonts[size][colorKey] : fonts[16].black;
+            const color = brightness > 128 ? 'black' : 'white';
 
-            // Word wrap to fit width
+            // Load font (cached)
+            let font;
+            try {
+                font = await getFont(size, color);
+            } catch (err) {
+                errors.push(`Font load error: ${err.message}`);
+                console.error(errors[errors.length - 1]);
+                continue;
+            }
+
+            // Word wrap
             const maxWidth = actualW - 10;
             const lines = [];
             let currentLine = '';
@@ -192,7 +213,7 @@ async function renderTextOnImage(imageBuffer, regions) {
             let startY = y + (actualH - totalHeight) / 2;
             if (startY < y) startY = y + 2;
 
-            // Draw each line, centered horizontally
+            // Draw each line centered
             for (let li = 0; li < lines.length; li++) {
                 const line = lines[li];
                 const lineWidth = line.length * charWidth;
