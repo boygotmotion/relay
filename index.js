@@ -75,11 +75,12 @@ async function renderTextOnImage(imageBuffer, regions) {
         return { renderedBuffer: null, errors };
     }
 
-    // ✅ Load font properly
+    // ✅ Load font from the correct raw GitHub URL
     let font;
     try {
-        font = await Jimp.loadFont(Jimp.FONT_SANS_32_BLACK);  // Bigger font for visibility
-        console.log('✅ Font loaded (SANS_32_BLACK)');
+        const fontUrl = 'https://raw.githubusercontent.com/jimp-dev/jimp/refs/heads/main/plugins/plugin-print/fonts/open-sans/open-sans-16-black/open-sans-16-black.fnt';
+        font = await Jimp.loadFont(fontUrl);
+        console.log('✅ Font loaded from GitHub raw URL');
     } catch (err) {
         errors.push(`Font load failed: ${err.message}`);
         console.error(errors[0]);
@@ -103,10 +104,8 @@ async function renderTextOnImage(imageBuffer, regions) {
         const actualH = endY - y;
 
         try {
-            // 1. Sample background color from the 1-pixel border around the region
-            //    (to fill the background with a similar color)
+            // Sample background color from the region's border
             const sampleColors = [];
-            // Top and bottom edges
             for (let px = Math.max(0, x-1); px < Math.min(endX+1, image.bitmap.width); px++) {
                 for (const py of [Math.max(0, y-1), Math.min(endY, image.bitmap.height-1)]) {
                     const idx = (py * image.bitmap.width + px) * 4;
@@ -117,7 +116,6 @@ async function renderTextOnImage(imageBuffer, regions) {
                     ]);
                 }
             }
-            // Left and right edges
             for (let py = Math.max(0, y-1); py < Math.min(endY+1, image.bitmap.height); py++) {
                 for (const px of [Math.max(0, x-1), Math.min(endX, image.bitmap.width-1)]) {
                     const idx = (py * image.bitmap.width + px) * 4;
@@ -128,7 +126,6 @@ async function renderTextOnImage(imageBuffer, regions) {
                     ]);
                 }
             }
-            // Compute average color
             let avgR = 0, avgG = 0, avgB = 0;
             for (const c of sampleColors) {
                 avgR += c[0]; avgG += c[1]; avgB += c[2];
@@ -138,26 +135,25 @@ async function renderTextOnImage(imageBuffer, regions) {
                 avgG = Math.round(avgG / sampleColors.length);
                 avgB = Math.round(avgB / sampleColors.length);
             } else {
-                avgR = 255; avgG = 255; avgB = 255; // fallback white
+                avgR = 255; avgG = 255; avgB = 255;
             }
 
-            // 2. Paint background with the sampled color (slightly transparent to blend)
+            // Paint background (semi-transparent)
             image.scan(x, y, actualW, actualH, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = avgR;
                 this.bitmap.data[idx + 1] = avgG;
                 this.bitmap.data[idx + 2] = avgB;
-                this.bitmap.data[idx + 3] = 200; // ~78% opacity
+                this.bitmap.data[idx + 3] = 200;
             });
 
-            // 3. Draw the translated text
+            // Draw translated text with word wrap
             const text = region.tranContent || '';
             const maxWidth = actualW - 10;
             const lines = [];
             let currentLine = '';
             const words = text.split(' ');
             for (const word of words) {
-                // Approx width: 9px per character for 32px font
-                if ((currentLine + ' ' + word).length * 9 < maxWidth) {
+                if ((currentLine + ' ' + word).length * 8 < maxWidth) {
                     currentLine += (currentLine ? ' ' : '') + word;
                 } else {
                     if (currentLine) lines.push(currentLine);
@@ -166,11 +162,10 @@ async function renderTextOnImage(imageBuffer, regions) {
             }
             if (currentLine) lines.push(currentLine);
 
-            const lineHeight = 38;
+            const lineHeight = 20;
             let lineY = y + 5;
             for (const line of lines) {
                 if (lineY + lineHeight > endY) break;
-                // Draw text with black color
                 image.print(font, x + 5, lineY, line);
                 lineY += lineHeight;
             }
