@@ -63,7 +63,6 @@ async function extractTextWithOCR(imageBuffer) {
     }
 }
 
-// ----- Font cache (loaded from GitHub raw URLs) -----
 let fontCache = {};
 
 async function getFont(size, color) {
@@ -84,7 +83,6 @@ async function getFont(size, color) {
     try {
         const font = await Jimp.loadFont(url);
         fontCache[key] = font;
-        console.log(`✅ Loaded font: ${size}-${color} from URL`);
         return font;
     } catch (err) {
         throw new Error(`Failed to load font ${size}-${color}: ${err.message}`);
@@ -96,146 +94,97 @@ async function renderTextOnImage(imageBuffer, regions) {
     let image;
     try {
         image = await Jimp.read(imageBuffer);
-        console.log(`📐 Image dimensions: ${image.bitmap.width}x${image.bitmap.height}`);
     } catch (err) {
-        errors.push(`Jimp.read failed: ${err.message}`);
-        console.error(errors[0]);
-        return { renderedBuffer: null, errors };
+        return { renderedBuffer: null, errors: [err.message] };
     }
 
     for (let i = 0; i < regions.length; i++) {
         const region = regions[i];
         const [x, y, w, h] = region.boundingBox.split(',').map(Number);
-        console.log(`📦 Region ${i}: x=${x}, y=${y}, w=${w}, h=${h}`);
+        if (w <= 0 || h <= 0) continue;
 
-        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x >= image.bitmap.width || y >= image.bitmap.height) {
-            errors.push(`Invalid region ${i}: ${region.boundingBox}`);
-            console.warn(`⚠️ ${errors[errors.length-1]}`);
-            continue;
-        }
-
-        const endX = Math.min(x + w, image.bitmap.width);
-        const endY = Math.min(y + h, image.bitmap.height);
-        const actualW = endX - x;
-        const actualH = endY - y;
+        const actualW = Math.min(x + w, image.bitmap.width) - x;
+        const actualH = Math.min(y + h, image.bitmap.height) - y;
 
         try {
-            // Sample background color from the border
-            const sampleColors = [];
-            for (let px = Math.max(0, x - 1); px < Math.min(endX + 1, image.bitmap.width); px++) {
-                for (const py of [Math.max(0, y - 1), Math.min(endY, image.bitmap.height - 1)]) {
-                    const idx = (py * image.bitmap.width + px) * 4;
-                    sampleColors.push([
-                        image.bitmap.data[idx],
-                        image.bitmap.data[idx + 1],
-                        image.bitmap.data[idx + 2]
-                    ]);
-                }
-            }
-            for (let py = Math.max(0, y - 1); py < Math.min(endY + 1, image.bitmap.height); py++) {
-                for (const px of [Math.max(0, x - 1), Math.min(endX, image.bitmap.width - 1)]) {
-                    const idx = (py * image.bitmap.width + px) * 4;
-                    sampleColors.push([
-                        image.bitmap.data[idx],
-                        image.bitmap.data[idx + 1],
-                        image.bitmap.data[idx + 2]
-                    ]);
-                }
-            }
+            // Sampling background for the fill
             let avgR = 0, avgG = 0, avgB = 0;
-            for (const c of sampleColors) {
-                avgR += c[0]; avgG += c[1]; avgB += c[2];
-            }
-            if (sampleColors.length > 0) {
-                avgR = Math.round(avgR / sampleColors.length);
-                avgG = Math.round(avgG / sampleColors.length);
-                avgB = Math.round(avgB / sampleColors.length);
-            } else {
-                avgR = 255; avgG = 255; avgB = 255;
-            }
+            const idx = (Math.floor(y + actualH / 2) * image.bitmap.width + Math.floor(x + actualW / 2)) * 4;
+            avgR = image.bitmap.data[idx];
+            avgG = image.bitmap.data[idx+1];
+            avgB = image.bitmap.data[idx+2];
 
-            // Fill the region with sampled background (semi‑transparent)
+            // Clean background fill
             image.scan(x, y, actualW, actualH, function(px, py, idx) {
                 this.bitmap.data[idx + 0] = avgR;
                 this.bitmap.data[idx + 1] = avgG;
                 this.bitmap.data[idx + 2] = avgB;
-                this.bitmap.data[idx + 3] = 200;
+                this.bitmap.data[idx + 3] = 255;
             });
 
-            // Prepare translated text
-            const text = region.tranContent || '';
+            let text = region.tranContent || '';
             if (!text) continue;
 
-            // Determine font size (16, 32, or 64) based on region size
+            // --- FONT SELECTION & CLUSTERING FIX ---
             let size = 16;
-            if (actualH > 32 && actualW > 64) size = 32;
-            if (actualH > 64 && actualW > 128) size = 64;
-            // Ensure text fits width
-            const avgCharWidth = size * 0.55;
-            if (text.length * avgCharWidth > actualW - 10) {
-                if (size === 64) size = 32;
-                else if (size === 32) size = 16;
-            }
+            if (actualH > 70) size = 64;
+            else if (actualH > 35) size = 32;
 
-            // Choose text color based on background brightness
-            const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
-            const color = brightness > 128 ? 'black' : 'white';
+            const charWidth = size * 0.52;
+            const lineHeight = size * 1.25;
+            const maxLines = Math.floor(actualH / lineHeight) || 1;
 
-            // Load font (cached)
-            let font;
-            try {
-                font = await getFont(size, color);
-            } catch (err) {
-                errors.push(`Font load error: ${err.message}`);
-                console.error(errors[errors.length - 1]);
-                continue;
-            }
-
-            // Word wrap
-            const maxWidth = actualW - 10;
-            const lines = [];
-            let currentLine = '';
-            const words = text.split(' ');
-            const charWidth = size * 0.55;
-            for (const word of words) {
-                const testLine = currentLine ? currentLine + ' ' + word : word;
-                if (testLine.length * charWidth < maxWidth) {
-                    currentLine = testLine;
-                } else {
-                    if (currentLine) lines.push(currentLine);
-                    currentLine = word;
+            let lines = [];
+            
+            // If height only allows 1 line, DO NOT WRAP (Prevents Clustering/Overlap)
+            if (maxLines === 1) {
+                const maxChars = Math.floor((actualW - 10) / charWidth);
+                if (text.length > maxChars) {
+                    text = text.substring(0, Math.max(0, maxChars - 3)) + "...";
+                }
+                lines = [text];
+            } else {
+                // Multi-line word wrap logic
+                const words = text.split(' ');
+                let currentLine = '';
+                for (const word of words) {
+                    const testLine = currentLine ? currentLine + ' ' + word : word;
+                    if (testLine.length * charWidth < actualW - 10) {
+                        currentLine = testLine;
+                    } else {
+                        lines.push(currentLine);
+                        currentLine = word;
+                    }
+                }
+                if (currentLine) lines.push(currentLine);
+                
+                // Truncate vertically if too many lines
+                if (lines.length > maxLines) {
+                    lines = lines.slice(0, maxLines);
+                    lines[lines.length - 1] += "...";
                 }
             }
-            if (currentLine) lines.push(currentLine);
 
-            const lineHeight = size * 1.2;
-            const totalHeight = lines.length * lineHeight;
-            let startY = y + (actualH - totalHeight) / 2;
-            if (startY < y) startY = y + 2;
+            const brightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
+            const color = brightness > 128 ? 'black' : 'white';
+            const font = await getFont(size, color);
 
-            // Draw each line centered
+            const totalTextHeight = lines.length * lineHeight;
+            const startY = y + (actualH - totalTextHeight) / 2;
+
             for (let li = 0; li < lines.length; li++) {
                 const line = lines[li];
                 const lineWidth = line.length * charWidth;
                 const startX = x + (actualW - lineWidth) / 2;
-                const lineY = startY + li * lineHeight;
-                image.print(font, startX, lineY, line);
+                image.print(font, startX, startY + (li * lineHeight), line);
             }
+
         } catch (err) {
-            errors.push(`Render error on region ${i}: ${err.message}`);
-            console.error(errors[errors.length - 1]);
+            errors.push(`Error in region ${i}: ${err.message}`);
         }
     }
 
-    let renderedBuffer = null;
-    try {
-        renderedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
-        console.log(`✅ Rendered image size: ${renderedBuffer.length} bytes`);
-    } catch (err) {
-        errors.push(`getBufferAsync failed: ${err.message}`);
-        console.error(errors[errors.length - 1]);
-    }
-
+    const renderedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
     return { renderedBuffer, errors };
 }
 
@@ -246,22 +195,10 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
 
     try {
-        const originalBase64 = req.file.buffer.toString('base64');
-
-        console.log('🔍 Running OCR...');
         const ocrResult = await extractTextWithOCR(req.file.buffer);
-        
         if (!ocrResult || !ocrResult.text) {
-            return res.json({
-                errorCode: 1,
-                msg: "No text found in image",
-                render_image: originalBase64,
-                resRegions: [],
-                debug: "OCR returned no text"
-            });
+            return res.json({ errorCode: 0, render_image: req.file.buffer.toString('base64'), resRegions: [] });
         }
-
-        console.log(`📝 Extracted: ${ocrResult.text.substring(0, 100)}...`);
 
         const resRegions = [];
         for (const line of ocrResult.lines) {
@@ -273,59 +210,33 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
             if (line.Words && line.Words.length > 0) {
                 const firstWord = line.Words[0];
                 const lastWord = line.Words[line.Words.length - 1];
-                const x = Math.round(firstWord.Left);
-                const y = Math.round(firstWord.Top);
-                const w = Math.round(lastWord.Left + lastWord.Width - firstWord.Left);
-                const h = Math.round(Math.max(...line.Words.map(w => w.Top + w.Height)) - y);
+                const x = firstWord.Left;
+                const y = firstWord.Top;
+                const w = (lastWord.Left + lastWord.Width) - firstWord.Left;
+                const h = Math.max(...line.Words.map(w => w.Height));
 
                 resRegions.push({
                     context: srcText,
                     tranContent: dstText,
-                    boundingBox: `${x},${y},${w},${h}`
+                    boundingBox: `${Math.round(x)},${Math.round(y)},${Math.round(w)},${Math.round(h)}`
                 });
             }
         }
 
-        if (resRegions.length === 0 && ocrResult.text) {
-            const dstText = (await translateWithGoogle(ocrResult.text, fromRequested, toRequested)) || ocrResult.text;
-            resRegions.push({
-                context: ocrResult.text,
-                tranContent: dstText,
-                boundingBox: `0,0,800,100`
-            });
-        }
-
-        console.log(`📤 Found ${resRegions.length} regions to render`);
-
-        const { renderedBuffer, errors } = await renderTextOnImage(req.file.buffer, resRegions);
+        const { renderedBuffer } = await renderTextOnImage(req.file.buffer, resRegions);
         
-        let renderImageBase64;
-        let debugMsg = null;
-        if (renderedBuffer) {
-            renderImageBase64 = renderedBuffer.toString('base64');
-            console.log('✅ Image rendered successfully');
-        } else {
-            renderImageBase64 = originalBase64;
-            debugMsg = "Rendering failed, returning original image. Errors: " + errors.join('; ');
-            console.warn(`⚠️ ${debugMsg}`);
-        }
-
-        const response = {
+        res.json({
             errorCode: 0,
-            render_image: renderImageBase64,
+            render_image: renderedBuffer.toString('base64'),
             resRegions: resRegions
-        };
-        if (debugMsg) response.debug = debugMsg;
-        if (errors && errors.length > 0) response.renderErrors = errors;
-
-        res.json(response);
+        });
 
     } catch (err) {
-        console.error("❌ Error:", err.message);
-        res.json({ errorCode: 1, msg: err.message, stack: err.stack });
+        res.json({ errorCode: 1, msg: err.message });
     }
 });
 
-app.get("/", (req, res) => res.send("🚀 PixPin Native Relay is LIVE"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Relay running on port ${PORT}`));
 
 export default app;
