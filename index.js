@@ -2,6 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const multer = require("multer");
 const Tesseract = require("tesseract.js");
+Tesseract.setCorePath("/tesseract-core-simd.wasm");
 const Jimp = require("jimp");
 
 const app = express();
