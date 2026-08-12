@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
-import svg2png from "svg2png";
+import sharp from "sharp";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -40,8 +40,10 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
         console.log(`📝 Extracted: ${result.text ? result.text.substring(0, 100) : 'No text'}...`);
         console.log(`📝 Translated: ${result.translatedText ? result.translatedText.substring(0, 100) : 'No translation'}...`);
 
-        // ✅ Convert SVG to PNG using svg2png (pure JS)
-        const pngBuffer = await svg2png(result.svg, { width: result.width || 800, height: result.height || 600 });
+        // ✅ Convert SVG to PNG using sharp
+        const pngBuffer = await sharp(Buffer.from(result.svg))
+            .png()
+            .toBuffer();
 
         const base64Image = pngBuffer.toString('base64');
 
