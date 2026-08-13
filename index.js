@@ -3,6 +3,7 @@ import axios from "axios";
 import multer from "multer";
 import FormData from "form-data";
 import path from "path";
+import fs from "fs";
 import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
 const app = express();
@@ -11,17 +12,24 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- 1. FONT REGISTRATION (Essential for Vercel & CJK/Arabic) ---
-const CJK_PATH = path.join(process.cwd(), "fonts", "NotoSansCJKsc-Regular.otf");
-const ARABIC_PATH = path.join(process.cwd(), "fonts", "NotoSansArabic-Regular.ttf");
+// --- 1. ROBUST FONT REGISTRATION ---
+// On Vercel, process.cwd() is the root of your project
+const fontsDir = path.resolve(process.cwd(), "fonts");
+const fontFiles = [
+    { file: "NotoSansArabic-Regular.ttf", name: "NotoArabic" },
+    { file: "NotoSansCJKsc-Regular.otf", name: "NotoSansCJK" },
+    { file: "NotoSans-Regular.ttf", name: "NotoSans" }
+];
 
-try {
-    GlobalFonts.registerFromPath(CJK_PATH, "NotoSansCJK");
-    GlobalFonts.registerFromPath(ARABIC_PATH, "NotoArabic");
-    console.log("✅ Fonts Registered: NotoSansCJK, NotoArabic");
-} catch (e) {
-    console.error("❌ Font Loading Failed! Ensure files exist in /fonts folder.");
-}
+fontFiles.forEach(f => {
+    const p = path.join(fontsDir, f.file);
+    if (fs.existsSync(p)) {
+        GlobalFonts.registerFromPath(p, f.name);
+        console.log(`✅ Font Loaded: ${f.name}`);
+    } else {
+        console.error(`❌ Font missing at: ${p}`);
+    }
+});
 
 // --- 2. LANGUAGE HELPERS ---
 function toGoogleLang(l) {
@@ -36,7 +44,7 @@ function toOCRLang(l) {
     return dict[s] || "eng";
 }
 
-// --- 3. TRANSLATION (Google GTX) ---
+// --- 3. TRANSLATION & OCR ---
 async function translateWithGoogle(txt, f, t) {
     try {
         let src = (f === "auto" || f === "au") ? "auto" : toGoogleLang(f);
@@ -51,11 +59,10 @@ async function translateWithGoogle(txt, f, t) {
     } catch (e) { return txt; }
 }
 
-// --- 4. OCR (OCR.space) ---
 async function extractTextWithOCR(imageBuffer, fromLang) {
     try {
         const formData = new FormData();
-        formData.append('apikey', 'helloworld'); // Replace with your key for production
+        formData.append('apikey', 'helloworld'); 
         formData.append('file', imageBuffer, { filename: 'image.jpg' });
         formData.append('language', toOCRLang(fromLang));
         formData.append('OCREngine', '2');
@@ -76,7 +83,7 @@ async function extractTextWithOCR(imageBuffer, fromLang) {
     } catch (e) { return null; }
 }
 
-// --- 5. SMART RENDERING ENGINE ---
+// --- 4. MASTER RENDERING ENGINE ---
 async function renderTextOnImage(imageBuffer, regions) {
     const img = await loadImage(imageBuffer);
     const canvas = createCanvas(img.width, img.height);
@@ -89,68 +96,70 @@ async function renderTextOnImage(imageBuffer, regions) {
         const text = region.tranContent || '';
         if (!text || w <= 0 || h <= 0) continue;
 
-        // A. Background Masking
+        // A. Background Sampling
         const sampleX = Math.max(0, x - 2);
         const sampleY = Math.max(0, y - 2);
         const pixelData = ctx.getImageData(sampleX, sampleY, 1, 1).data;
-        const r = pixelData[0], g = pixelData[1], b = pixelData[2];
-        
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillStyle = `rgb(${pixelData[0]},${pixelData[1]},${pixelData[2]})`;
         ctx.fillRect(x - 1, y - 1, w + 2, h + 2); 
 
-        // B. Dynamic Text Color
-        const brightness = (r * 0.299 + g * 0.587 + b * 0.114);
+        // B. Color Contrast Logic
+        const brightness = (pixelData[0] * 0.299 + pixelData[1] * 0.587 + pixelData[2] * 0.114);
         ctx.fillStyle = brightness > 125 ? 'black' : 'white';
 
-        // C. Font Setup (Arabic + CJK fallback)
+        // C. Font & Language Logic
         let fontSize = Math.floor(h * 0.82); 
-        ctx.font = `${fontSize}px "NotoArabic", "NotoSansCJK", sans-serif`;
+        const isArabic = /[\u0600-\u06FF]/.test(text);
+        const fontChain = '"NotoArabic", "NotoSansCJK", "NotoSans", sans-serif';
+        
+        ctx.font = `${fontSize}px ${fontChain}`;
         ctx.textBaseline = 'middle';
 
-        // D. Arabic RTL Logic
-        const isArabic = /[\u0600-\u06FF]/.test(text);
         if (isArabic) {
+            // ARABIC SPECIAL: Fixes shaping and punctuation placement
+            ctx.direction = 'rtl'; 
             ctx.textAlign = 'right';
-            ctx.fillText(text, x + w, y + (h / 2), w); 
+            
+            let measured = ctx.measureText(text).width;
+            if (measured > w) {
+                const shrunkSize = Math.floor(fontSize * (w / measured));
+                ctx.font = `${shrunkSize}px ${fontChain}`;
+            }
+            // Draw from right to left
+            ctx.fillText(text, x + w, y + (h / 2)); 
         } else {
+            // CJK & LATIN: Normal behavior
+            ctx.direction = 'ltr';
             ctx.textAlign = 'left';
             ctx.fillText(text, x, y + (h / 2), w); 
         }
-        
-        // Reset alignment for next loop
-        ctx.textAlign = 'left';
     }
 
     return canvas.toBuffer('image/jpeg');
 }
 
-// --- 6. API ROUTE ---
+// --- 5. API ENDPOINT ---
 app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
-    if (!req.file) return res.json({ errorCode: 1, msg: "No image provided" });
+    if (!req.file) return res.json({ errorCode: 1, msg: "No image" });
     const { from = "auto", to = "zh" } = req.body;
 
     try {
-        // 1. OCR
         const ocr = await extractTextWithOCR(req.file.buffer, from);
-        if (!ocr || !ocr.lines) throw new Error("OCR Failed to detect text");
+        if (!ocr || !ocr.lines) throw new Error("OCR Failed");
 
-        // 2. TRANSLATE
         const resRegions = [];
         for (const line of ocr.lines) {
             const dstText = await translateWithGoogle(line.LineText, from, to);
             const first = line.Words[0];
             const last = line.Words[line.Words.length - 1];
-            
             resRegions.push({
                 tranContent: dstText,
                 boundingBox: `${first.Left},${first.Top},${(last.Left + last.Width) - first.Left},${line.MaxHeight}`
             });
         }
 
-        // 3. RENDER
         const renderedBuffer = await renderTextOnImage(req.file.buffer, resRegions);
         
-        // 4. RESPOND
         res.json({ 
             errorCode: 0, 
             render_image: renderedBuffer.toString('base64'), 
@@ -162,11 +171,8 @@ app.post("/api/trans/sdk/picture", upload.single("image"), async (req, res) => {
     }
 });
 
-// For Vercel, we export the app
 export default app;
 
-// For local testing
+// Local test listener
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running at http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Translator Running on ${PORT}`));
